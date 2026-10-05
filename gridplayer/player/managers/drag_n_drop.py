@@ -22,7 +22,7 @@ from gridplayer.utils.files import (
     get_playlist_path,
     mime_has_video,
 )
-from gridplayer.utils.qt import is_modal_open
+from gridplayer.utils.qt import belongs_to_a_dialog, is_modal_open
 
 # X11 XDND Enter is a later client message, not already queued. timer(0)
 # ends drag UI (and overlay input passthrough) before the player gets Enter.
@@ -80,7 +80,14 @@ class DragNDropManager(ManagerBase):
 
     # --- start drag (mouse) ---
 
-    def mousePressEvent(self, event):
+    def mousePressEvent(self, event, event_object):
+        # first, and before anything that consumes the event: a press meant
+        # for a dialog is never the player's to answer, whatever state the
+        # player is in
+        if belongs_to_a_dialog(event_object):
+            self._drag_start_position = None
+            return
+
         if self._is_fake_drag_active:
             return True
 
@@ -109,8 +116,8 @@ class DragNDropManager(ManagerBase):
 
         self._drag_start_position = event.pos()
 
-    def mouseMoveEvent(self, event):
-        if is_modal_open():
+    def mouseMoveEvent(self, event, event_object):
+        if is_modal_open() or belongs_to_a_dialog(event_object):
             self._drag_start_position = None
             self._cancel_fake_drag()
             return
@@ -136,7 +143,10 @@ class DragNDropManager(ManagerBase):
             drag.exec()
             self._end_drag_ui()
 
-    def mouseReleaseEvent(self, event):
+    def mouseReleaseEvent(self, event, event_object):
+        if belongs_to_a_dialog(event_object):
+            return None
+
         if not self._is_fake_drag_active:
             return None
 

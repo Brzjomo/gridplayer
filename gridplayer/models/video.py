@@ -158,6 +158,15 @@ class Video(BaseModel):
     loop_start: int | None = None
     loop_end: int | None = None
 
+    # The point on this video's own timeline that a common reference moment
+    # falls on, so recordings that begin at different times can be played
+    # together: with two videos, the moment one shows at offset A is the one
+    # the other shows at offset B. None counts as 0, which leaves a video
+    # timed from its own start as before. Milliseconds, since the frame rate
+    # is not always known and differs between recordings; what it comes to in
+    # frames is worked out per video from its own track.
+    sync_offset_ms: int | None = None
+
     end_action: VideoEndAction = session_field("video_defaults/end_action")
     is_start_random: bool = session_field("video_defaults/random_loop")
     rate: Annotated[float, Field(ge=MIN_RATE, le=MAX_RATE)] = session_field(

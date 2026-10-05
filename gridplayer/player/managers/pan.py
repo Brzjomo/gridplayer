@@ -5,7 +5,7 @@ from PyQt5.QtWidgets import QApplication
 from gridplayer.params.static import PanTrigger
 from gridplayer.player.managers.base import ManagerBase
 from gridplayer.settings import Settings
-from gridplayer.utils.qt import is_modal_open
+from gridplayer.utils.qt import belongs_to_a_dialog, is_modal_open
 from gridplayer.widgets.video_overlay_buttons import OverlayButton
 from gridplayer.widgets.video_overlay_elements import OverlayBar
 
@@ -67,7 +67,13 @@ class PanManager(ManagerBase):
 
         return self._pan_block(event) is not None
 
-    def mouse_press(self, event):
+    def mouse_press(self, event, event_object):
+        # a press meant for a dialog over the videos is not a press on them;
+        # the block under it is found by where the pointer is, not by what is
+        # over it
+        if belongs_to_a_dialog(event_object):
+            return
+
         # seen again by every widget the press is passed up through
         if self._block is not None:
             return

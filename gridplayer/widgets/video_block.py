@@ -143,7 +143,7 @@ from gridplayer.utils.sponsorblock import (
     skip_spans,
     sponsorblock_fetcher,
 )
-from gridplayer.utils.time_txt import timed_title
+from gridplayer.utils.time_txt import ms_time_txt, parse_time_txt, timed_title
 from gridplayer.utils.track_language import language_name, normalize, pick_track
 from gridplayer.utils.url_resolve.static import ResolvedVideo
 from gridplayer.utils.url_resolve.url_resolve import VideoURLResolver
@@ -209,6 +209,18 @@ LEAVING_END_ACTIONS = frozenset(
         VideoEndAction.CLOSE,
     }
 )
+
+# How far short of the end a video with nothing left to show is held, when a
+# sync offset asks for a moment past it. Landing on the very end reads as the
+# pass finishing, and the end action would then take the video away rather
+# than leave it saying why it has nothing.
+SYNC_END_MARGIN_MS = 1000
+
+# How far off the moment being asked for a video may already be and still
+# count as being there. Lining videos up on starting playback puts each on
+# the moment it should be at, and seeking one already on it costs a stutter
+# at the very moment the viewer wants it to go.
+SYNC_SEEK_SLACK_MS = 1
 
 
 class QStackedLayoutFloating(QStackedLayout):
@@ -290,6 +302,29 @@ def only_streamable(func):
     return wrapper
 
 
+def _is_overlay_stood_down(ctx) -> bool:
+    """Whether the overlays are to stay away for something over the videos.
+
+    Apart from is_disable_overlay, which is the viewer's own switch and is
+    what the menu's tick reads: this one is put up by whatever covers the
+    cells, and taken down again when it goes.
+
+    A floating overlay is a window of its own, above the window the videos
+    are in, taking presses without taking focus. A dialog lying across a
+    cell would have its buttons where the overlay is, and the overlay would
+    keep the press.
+
+    Read off the context and not off the block, because a stand-in block --
+    which is what a test hands these methods -- answers truthily to
+    anything asked of it, and would read as a suppression nobody asked for.
+    `is True` for the same reason: a stand-in context does too.
+    """
+
+    return bool(ctx.is_disable_overlay) or (
+        getattr(ctx, "is_overlay_suppressed", False) is True
+    )
+
+
 def _file_names(file_paths) -> str:
     return ", ".join(file_path.name for file_path in file_paths)
 
@@ -303,6 +338,81 @@ def audio_delay_txt(delay_ms: int) -> str:
         return f"0 {milliseconds}"
 
     return f"{delay_ms:+d} {milliseconds}"
+
+
+def sync_offset_txt(offset_ms: int, fps: float | None = None) -> str:
+    """A sync offset as it reads.
+
+    Signed, because which way it goes is the point, and in frames as well
+    where the recording's frame rate is known: a frame is what lining two
+    recordings up is done in, and what one comes to differs between them.
+    """
+
+    sign = "-" if offset_ms < 0 else "+"
+    time_txt = f"{sign}{ms_time_txt(abs(offset_ms))}"
+
+    if not fps:
+        return time_txt
+
+    frames = round(abs(offset_ms) * fps / 1000)
+
+    return f"{time_txt} ({sign}{frames}f)"
+
+
+def parse_sync_offset_txt(text: str) -> int | None:
+    """A sync offset typed the way it reads, sign and all: 1:15.000, -0:05."""
+
+    text = text.strip()
+
+    is_negative = text.startswith("-")
+
+    if is_negative or text.startswith("+"):
+        text = text[1:]
+
+    parsed = parse_time_txt(text)
+
+    if parsed is None:
+        return None
+
+    return -parsed if is_negative else parsed
+
+
+def sync_gap_txt(amount_ms: int, fps: float | None = None) -> str:
+    """How much of a gap, without a sign.
+
+    Which way it goes is said in the words around it, and a sign of its own
+    would be a second answer to a question already answered.
+    """
+
+    time_txt = ms_time_txt(abs(amount_ms))
+
+    if not fps:
+        return time_txt
+
+    return f"{time_txt} ({round(abs(amount_ms) * fps / 1000)}f)"
+
+
+def sync_out_of_range_txt(
+    is_before: bool, short_by: int, fps: float | None = None
+) -> str:
+    """How a recording says it holds nothing where it is being asked to go.
+
+    Which end it ran out at is worth telling apart: one of them has a
+    picture coming in a moment, and the other never will.
+    """
+
+    short_by_txt = sync_gap_txt(short_by, fps)
+
+    if is_before:
+        return translate(
+            "Video Status",
+            "Out of video range — recording starts {SHORT_BY} later",
+        ).format(SHORT_BY=short_by_txt)
+
+    return translate(
+        "Video Status",
+        "Out of video range — recording ended {SHORT_BY} earlier",
+    ).format(SHORT_BY=short_by_txt)
 
 
 def _audio_files_filter() -> str:
@@ -415,6 +525,13 @@ class VideoBlock(QWidget):
     sync_percent = pyqtSignal(float)
     sync_time = pyqtSignal(MILLISECONDS)
     sync_paused = pyqtSignal(bool)
+    # this block's id and where it now is, for the others to work their own
+    # positions out of their sync offsets; the id says which one moved
+    sync_offset = pyqtSignal(str, MILLISECONDS)
+    # this block's id and whether playback is to be held, for the same
+    # reason: videos lined up against one another have to run together, or
+    # the ones left sitting where they were drift out of it again
+    sync_playback = pyqtSignal(str, bool)
 
     time_change = pyqtSignal(MILLISECONDS, MILLISECONDS)
     volume_change = pyqtSignal(float)
@@ -449,6 +566,10 @@ class VideoBlock(QWidget):
         self._is_active = False
         self._is_closing = False
         self._drop_indicator = DropIndicator.NONE
+
+        # where a seek landed off the end of what this recording holds, as
+        # (is_before_the_start, how_far_past_ms); see apply_sync_position
+        self._sync_out_of_range: tuple[bool, int] | None = None
 
         self._title = None
         self._color = None
@@ -680,6 +801,11 @@ class VideoBlock(QWidget):
 
     def reset(self):
         self._is_error = False
+
+        # the recording is going away, so whatever it did or did not hold
+        # says nothing about whatever opens next
+        self._sync_out_of_range = None
+
         self.set_status("processing")
 
         self._destroy_video_driver()
@@ -1054,6 +1180,10 @@ class VideoBlock(QWidget):
 
         self.sync_percent.emit(self.position)
         self.sync_time.emit(int(self.video_driver.length * self.position))
+        # self.time rather than the position it makes: the seek set it
+        # outright, and working it back out of the length loses the odd
+        # millisecond to the float in between
+        self.sync_offset.emit(self.id, self.time)
 
     @only_initialized
     @only_seekable
@@ -1064,6 +1194,227 @@ class VideoBlock(QWidget):
     @only_seekable
     def sync_others_time(self):
         self.sync_time_single.emit(int(self.video_driver.length * self.position))
+
+    # --- Sync offset: lining up recordings that begin at different times ---
+
+    @property
+    def sync_offset_ms(self) -> int:
+        """The point on this recording's timeline a common moment falls on."""
+
+        if self.video_params is None:
+            return 0
+
+        return self.video_params.sync_offset_ms or 0
+
+    @sync_offset_ms.setter
+    def sync_offset_ms(self, offset_ms: int) -> None:
+        if self.video_params is None:
+            return
+
+        # unset and 0 come to the same thing, and only one of them is written
+        # into a playlist
+        self.video_params.sync_offset_ms = int(offset_ms) or None
+
+    @property
+    def video_fps(self) -> float | None:
+        """The frame rate of what is playing, where the track reports one.
+
+        Not every container says, and a frame comes to a different length in
+        each recording, so an offset in frames is only offered where the rate
+        is actually known.
+        """
+
+        media = getattr(self.video_driver, "media", None)
+
+        if media is None:
+            return None
+
+        track = media.cur_video_track
+
+        return track.fps if track is not None else None
+
+    @property
+    def is_sync_offset_in_frames(self) -> bool:
+        return bool(self.video_fps)
+
+    @property
+    def sync_out_of_range(self) -> tuple[bool, int] | None:
+        """Whether this recording holds nothing where it is being asked to
+        go, as (is_before_the_start, how_far_past_it_lies_ms)."""
+
+        return self._sync_out_of_range
+
+    def get_sync_offset_txt(self) -> str:
+        return sync_offset_txt(self.sync_offset_ms, self.video_fps)
+
+    @only_initialized
+    @only_seekable
+    def set_sync_point_here(self):
+        """Mark where this video now is as the point a common moment falls on.
+
+        The way the offsets are meant to be set: pause every video, move each
+        one to the same moment of what it recorded, and mark that moment here.
+        With one marked on every video they are lined up, and stay lined up
+        through every seek after that.
+
+        Nothing is moved, here or anywhere else: the whole point is that the
+        viewer put this video where it is.
+        """
+
+        self.sync_offset_ms = self.time
+
+        self._log.debug(f"Sync point marked at {self.sync_offset_ms}ms")
+
+    @only_initialized
+    @only_seekable
+    def sync_offset_shift_frames(self, frames: int):
+        fps = self.video_fps
+
+        if not fps:
+            return
+
+        self.sync_offset_shift_ms(round(frames * 1000 / fps))
+
+    @only_initialized
+    @only_seekable
+    def sync_offset_shift_ms(self, shift_ms: int):
+        self.sync_offset_set(self.sync_offset_ms + shift_ms)
+
+    @only_initialized
+    @only_seekable
+    def sync_offset_set(self, offset_ms: int):
+        """Move this video against the others by moving its sync point.
+
+        The moment on show is kept, so the picture moves by exactly what the
+        point did and every other video stays where it is. What changes is
+        where this recording sits against them.
+        """
+
+        offset_ms = int(offset_ms)
+
+        if offset_ms == self.sync_offset_ms:
+            return
+
+        shift_ms = offset_ms - self.sync_offset_ms
+
+        self.sync_offset_ms = offset_ms
+
+        self.apply_sync_position(self.time + shift_ms, self.video_params.is_paused)
+
+    @only_initialized
+    @only_seekable
+    def sync_offset_reset(self):
+        self.sync_offset_set(0)
+
+    @only_initialized
+    @only_seekable
+    def sync_offset_align_others(self):
+        """Take every other video to the moment this one is on.
+
+        What a seek already does, sent for a video that has been put where
+        it wanted to be rather than moved there: the offsets are what carry
+        it, so nothing here needs to know them.
+        """
+
+        self.sync_offset.emit(self.id, self.time)
+
+    def sync_offset_dialog(self):
+        """Ask for an offset outright, typed the way the readout reads."""
+
+        if not self.is_video_initialized or self.is_live:
+            return
+
+        text = QCustomTextInput.get_text(
+            self.parent(),
+            translate("Dialog - Sync offset", "Sync offset", "Header"),
+            sync_offset_txt(self.sync_offset_ms),
+            placeholder=translate("Dialog - Sync offset", "-0:05.000"),
+        )
+
+        offset_ms = parse_sync_offset_txt(text)
+
+        if offset_ms is None:
+            return
+
+        self.sync_offset_set(offset_ms)
+
+    def apply_sync_position(self, target_ms: int, is_paused: bool):
+        """Go where the sync offset puts this video, or say why it cannot.
+
+        A recording holding nothing at that moment is held at the end it ran
+        out at and says how far past it the moment lies. That is the one
+        thing worth knowing while lining recordings up: not that there is no
+        picture, but by how much there is none.
+        """
+
+        if not self.is_video_initialized or self.is_live:
+            return
+
+        target_ms = int(target_ms)
+        length = self.video_driver.length
+
+        if target_ms < 0:
+            self._set_sync_out_of_range(is_before=True, short_by=-target_ms)
+
+            self.seek(0)
+            self.set_pause(True)
+
+            return
+
+        if length and target_ms >= length:
+            self._set_sync_out_of_range(is_before=False, short_by=target_ms - length)
+
+            # a margin, not the very end: seeking onto the end reads as the
+            # pass finishing, and the end action would take the video away
+            self.seek(max(0, length - SYNC_END_MARGIN_MS))
+            self.set_pause(True)
+
+            return
+
+        self.clear_sync_out_of_range()
+
+        # already on the moment: seeking onto it again costs a stutter at
+        # the very moment the viewer asked for it to go, and moves nothing
+        if abs(self.time - target_ms) > SYNC_SEEK_SLACK_MS:
+            self.seek(target_ms)
+
+        self.set_pause(is_paused)
+
+    def _set_sync_out_of_range(self, is_before: bool, short_by: int):
+        """Say that this recording has nothing where it is being asked to go."""
+
+        self._log.debug(
+            f"Sync offset out of range: before={is_before}, short_by={short_by}ms"
+        )
+
+        if self._sync_out_of_range == (is_before, short_by):
+            return
+
+        self._sync_out_of_range = (is_before, short_by)
+
+        status_txt = sync_out_of_range_txt(is_before, short_by, self.video_fps)
+
+        self.set_status("warning")
+        self.update_status(status_txt)
+
+    def clear_sync_out_of_range(self):
+        """Put the picture back, where it was only the range that hid it."""
+
+        if self._sync_out_of_range is None:
+            return
+
+        self._sync_out_of_range = None
+
+        # an error of its own is not ours to take off the screen
+        if self._is_error:
+            return
+
+        self.video_status.hide()
+
+        if self.video_driver is not None:
+            self.video_driver.show()
+
+        self.show_overlay()
 
     @only_initialized
     @only_seekable
@@ -2669,7 +3020,7 @@ class VideoBlock(QWidget):
         )
 
     def show_overlay(self):
-        if self._ctx.is_drag_ui or self._ctx.is_disable_overlay:
+        if self._ctx.is_drag_ui or _is_overlay_stood_down(self._ctx):
             return
         if self.is_loading or self._is_error:
             return
@@ -2688,7 +3039,7 @@ class VideoBlock(QWidget):
         if self._ctx.is_drag_ui:
             return
 
-        if self._ctx.is_disable_overlay:
+        if _is_overlay_stood_down(self._ctx):
             self.overlay_hide_timer.stop()
             self.overlay.hide()
             return
@@ -4644,7 +4995,13 @@ class VideoBlock(QWidget):
         self.set_volume(self.video_params.volume)
 
     def play_pause(self):
-        self.set_pause(not self.video_params.is_paused)
+        is_paused = not self.video_params.is_paused
+
+        self.set_pause(is_paused)
+
+        # the intent, not what came of it: the videos lined up with this one
+        # follow whether or not this one had anywhere to go
+        self.sync_playback.emit(self.id, is_paused)
 
     @only_local_file
     def previous_video(self):

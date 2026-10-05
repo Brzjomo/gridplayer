@@ -93,6 +93,7 @@ def _seek_sync_modes() -> dict:
         SeekSyncMode.DISABLED: translate("Seek Sync", "Disabled"),
         SeekSyncMode.PERCENT: translate("Seek Sync", "Percent"),
         SeekSyncMode.TIMECODE: translate("Seek Sync", "Timecode"),
+        SeekSyncMode.OFFSET: translate("Seek Sync", "Sync Offset"),
     }
 
 

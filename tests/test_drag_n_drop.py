@@ -4,11 +4,12 @@ from types import SimpleNamespace
 import pytest
 from PyQt5.QtCore import QEvent, QPoint, QPointF, Qt
 from PyQt5.QtGui import QKeyEvent, QMouseEvent
-from PyQt5.QtWidgets import QApplication, QWidget
+from PyQt5.QtWidgets import QApplication, QDialog, QPushButton, QWidget
 
 from gridplayer.params.static import DropAction, DropModifier
 from gridplayer.player.managers.drag_n_drop import DragNDropManager
 from gridplayer.utils.drag_n_drop import drop_is_replace
+from gridplayer.utils.qt import belongs_to_a_dialog
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -103,7 +104,7 @@ def test_a_left_press_is_the_start_of_moving_the_video(mocker):
         "gridplayer.player.managers.drag_n_drop.is_modal_open", return_value=False
     )
 
-    manager.mousePressEvent(_left_press())
+    manager.mousePressEvent(_left_press(), _parent)
 
     assert manager._drag_start_position == QPoint(10, 20)
 
@@ -117,7 +118,7 @@ def test_a_press_that_drags_the_picture_moves_no_video(mocker):
         "gridplayer.player.managers.drag_n_drop.is_modal_open", return_value=False
     )
 
-    manager.mousePressEvent(_left_press())
+    manager.mousePressEvent(_left_press(), _parent)
 
     assert manager._drag_start_position is None
 
@@ -135,7 +136,7 @@ def test_linux_uses_fake_drag_by_default(mocker):
     start_fake = mocker.patch.object(manager, "_start_fake_drag")
     make_qdrag = mocker.patch.object(manager, "_make_qdrag")
 
-    assert manager.mouseMoveEvent(_mouse_move()) is True
+    assert manager.mouseMoveEvent(_mouse_move(), _parent) is True
     start_fake.assert_called_once()
     make_qdrag.assert_not_called()
 
@@ -158,7 +159,7 @@ def test_linux_force_native_drag_uses_qdrag(mocker):
     mocker.patch.object(manager, "_set_source")
     mocker.patch.object(manager, "_end_drag_ui")
 
-    manager.mouseMoveEvent(_mouse_move())
+    manager.mouseMoveEvent(_mouse_move(), _parent)
 
     start_fake.assert_not_called()
     drag.exec.assert_called_once()
@@ -174,7 +175,7 @@ def test_fake_drag_mouse_move_does_not_use_event_keyboard_modifiers(mocker):
         QApplication, "queryKeyboardModifiers", return_value=Qt.ShiftModifier
     )
 
-    assert manager.mouseMoveEvent(_mouse_move()) is True
+    assert manager.mouseMoveEvent(_mouse_move(), _parent) is True
 
 
 def test_fake_drag_key_press_shift_does_not_use_event_keyboard_modifiers(mocker):
@@ -397,3 +398,89 @@ class TestADropFromAnotherInstance:
         registry, _video, _bookmarks = self._drop(tmp_path, is_taken=False)
 
         assert registry.entries() == []
+
+
+class TestAPressMeantForADialog:
+    """A dialog that stays open over the videos is not modal, so its presses
+    reach the players' global event filters like any other.
+
+    Answered as a press on the video behind it -- which is what a lookup by
+    where the pointer is, and not by what is over it, makes of it -- the
+    player is activated and the button under the pointer loses the focus it
+    needs between press and release. It is then not a click at all: the
+    first presses do nothing, and once the player is the active window there
+    is no focus left to take and the same presses start working.
+    """
+
+    def test_a_press_in_a_dialog_leaves_the_focus_alone(self, mocker):
+        manager, _parent = _make_manager()
+        activate = mocker.patch.object(manager._ctx.commands, "activate_window")
+        mocker.patch(
+            "gridplayer.player.managers.drag_n_drop.is_modal_open", return_value=False
+        )
+
+        dialog = QDialog()
+        button = QPushButton(dialog)
+
+        manager.mousePressEvent(_left_press(), button)
+
+        activate.assert_not_called()
+        assert manager._drag_start_position is None
+
+    def test_it_starts_no_drag_either(self, mocker):
+        manager, _parent = _make_manager()
+        mocker.patch(
+            "gridplayer.player.managers.drag_n_drop.is_modal_open", return_value=False
+        )
+
+        dialog = QDialog()
+
+        manager.mousePressEvent(_left_press(), dialog)
+
+        assert manager._drag_start_position is None
+
+    def test_a_press_on_the_video_still_activates_the_player(self, mocker):
+        """The guard is about where the press went, not about presses."""
+
+        manager, parent = _make_manager()
+        activate = mocker.patch.object(manager._ctx.commands, "activate_window")
+        mocker.patch(
+            "gridplayer.player.managers.drag_n_drop.is_modal_open", return_value=False
+        )
+
+        manager.mousePressEvent(_left_press(), parent)
+
+        activate.assert_called_once()
+
+    def test_moving_over_a_dialog_moves_nothing(self, mocker):
+        manager, _parent = _make_manager()
+        mocker.patch(
+            "gridplayer.player.managers.drag_n_drop.is_modal_open", return_value=False
+        )
+        start_fake = mocker.patch.object(manager, "_start_fake_drag")
+        mocker.patch.object(manager, "_is_drag_started", return_value=True)
+
+        dialog = QDialog()
+
+        assert manager.mouseMoveEvent(_mouse_move(), dialog) is None
+        start_fake.assert_not_called()
+
+
+class TestWhatCountsAsADialogEvent:
+    def test_a_button_inside_a_dialog_is_one(self):
+        dialog = QDialog()
+
+        assert belongs_to_a_dialog(QPushButton(dialog))
+
+    def test_the_dialog_itself_is_one(self):
+        assert belongs_to_a_dialog(QDialog())
+
+    def test_a_widget_of_the_player_is_not(self):
+        parent = QWidget()
+        child = QWidget(parent)
+
+        assert not belongs_to_a_dialog(child)
+
+    def test_something_that_is_no_widget_at_all_is_not(self):
+        assert not belongs_to_a_dialog(object())
+        assert not belongs_to_a_dialog(None)

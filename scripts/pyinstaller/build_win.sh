@@ -62,6 +62,13 @@ if [ ! -d "$VLC_EMBED_SRC" ]; then
 
     cp "$BUILD_DIR"/vlc-*/plugins/audio_output/libdirectsound_plugin.dll "$VLC_EMBED_SRC/plugins/audio_output"
 
+    # The silent output, which is not silent for the sake of it: lining
+    # recordings up by sound reads them by transcoding a snippet to a file,
+    # through a player of its own that must not be heard. Nothing else here
+    # asks for a second audio output, so without this the probe has none to
+    # name and cannot be given one. See vlc_player/audio_probe.py.
+    cp "$BUILD_DIR"/vlc-*/plugins/audio_output/libadummy_plugin.dll "$VLC_EMBED_SRC/plugins/audio_output"
+
     cp -a "$BUILD_DIR"/vlc-*/plugins/access "$VLC_EMBED_SRC/plugins"
     cp -a "$BUILD_DIR"/vlc-*/plugins/audio_filter "$VLC_EMBED_SRC/plugins"
     cp -a "$BUILD_DIR"/vlc-*/plugins/audio_mixer "$VLC_EMBED_SRC/plugins"

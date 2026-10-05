@@ -114,6 +114,7 @@ class ActiveBlockManager(ManagerBase):
             "is_active_initialized": self.is_active_initialized,
             "is_active_playable": self.is_active_playable,
             "is_active_seekable": self.is_active_seekable,
+            "is_active_offset_in_frames": self.is_active_offset_in_frames,
             "is_active_live": self.is_active_live,
             "is_active_multistream": self.is_active_multistream,
             "is_active_audio_language": self.is_active_audio_language,
@@ -219,6 +220,18 @@ class ActiveBlockManager(ManagerBase):
             return False
 
         return not self._ctx.active_block.is_live
+
+    def is_active_offset_in_frames(self):
+        """Whether the active video's frame rate is known.
+
+        An offset in frames is only offered where it is: what a frame comes
+        to differs between recordings, and a container need not say.
+        """
+
+        if not self.is_active_seekable():
+            return False
+
+        return self._ctx.active_block.is_sync_offset_in_frames
 
     def is_active_live(self):
         if not self.is_active_initialized():

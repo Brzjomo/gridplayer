@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 from PyQt5.QtCore import QEvent, QPoint, QPointF, Qt
 from PyQt5.QtGui import QMouseEvent
-from PyQt5.QtWidgets import QApplication, QWidget
+from PyQt5.QtWidgets import QApplication, QDialog, QWidget
 
 import gridplayer.player.managers.pan as pan_module
 from gridplayer.params.static import PanTrigger, VideoShift
@@ -82,8 +82,20 @@ def _event(kind, button=Qt.MiddleButton, buttons=Qt.MiddleButton, keys=Qt.NoModi
     return QMouseEvent(kind, QPointF(0, 0), button, buttons, keys)
 
 
+def _in_the_player():
+    """An event_object for a press that landed on the player itself.
+
+    What a press is answered by is what it went to, not only whether a
+    dialog is modal: see belongs_to_a_dialog.
+    """
+
+    return QWidget()
+
+
 def _press(manager, button=Qt.MiddleButton, keys=Qt.NoModifier):
-    return manager.mouse_press(_event(QEvent.MouseButtonPress, button, button, keys))
+    return manager.mouse_press(
+        _event(QEvent.MouseButtonPress, button, button, keys), _in_the_player()
+    )
 
 
 def _move_to(manager, x, y, buttons=Qt.MiddleButton):
@@ -180,6 +192,20 @@ def test_nothing_is_dragged_under_a_dialog(monkeypatch):
     manager = _manager(block)
 
     _press(manager)
+
+    assert _move_to(manager, 200, 100) is None
+    assert block.pans == []
+
+
+def test_nothing_is_dragged_under_a_dialog_that_is_not_modal():
+    """A dialog that has to stay open over the videos is not modal, and its
+    presses still belong to it: which block is under it is found by where
+    the pointer is, not by what is over it."""
+
+    block = _Block()
+    manager = _manager(block)
+
+    manager.mouse_press(_event(QEvent.MouseButtonPress), QDialog())
 
     assert _move_to(manager, 200, 100) is None
     assert block.pans == []

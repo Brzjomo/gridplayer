@@ -29,6 +29,10 @@ SUBMENUS = MappingProxyType(
             "title": translate("Actions", "Sync Others"),
             "icon": "seek-sync",
         },
+        "Sync Offset": {
+            "title": translate("Actions", "Sync Offset"),
+            "icon": "seek-sync",
+        },
         "Percent": {
             "title": translate("Actions", "Percent"),
             "icon": "seek-sync-percent",
@@ -257,6 +261,21 @@ SECTIONS = MappingProxyType(
                     "Seek Others",
                     "Seek Others (Percent)",
                     "Seek Others (Timecode)",
+                ),
+                (
+                    "Sync Offset",
+                    "Sync Offset: %v",
+                    "---",
+                    "Set Sync Point Here",
+                    "---",
+                    "Shift Sync Point Forward By One Frame",
+                    "Shift Sync Point Back By One Frame",
+                    "Shift Sync Point Forward By One Second",
+                    "Shift Sync Point Back By One Second",
+                    "---",
+                    "Sync Offset Reset",
+                    "---",
+                    "Align Videos…",
                 ),
                 (
                     "Loop",
@@ -535,6 +554,7 @@ SECTIONS = MappingProxyType(
                 "Seek Sync (Disabled)",
                 "Seek Sync (Percent)",
                 "Seek Sync (Timecode)",
+                "Seek Sync (Offset)",
             ),
             (
                 "Grid",

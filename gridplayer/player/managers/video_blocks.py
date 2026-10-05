@@ -2,6 +2,7 @@ import contextlib
 
 from PyQt5.QtCore import Qt, pyqtSignal
 
+from gridplayer.dialogs.align_videos import AlignVideosDialog
 from gridplayer.dialogs.audio_delay import SetAudioDelayDialog
 from gridplayer.dialogs.input_dialog import QCustomSpinboxInput, QCustomSpinboxTimeInput
 from gridplayer.dialogs.subtitle_delay import SetSubtitleDelayDialog
@@ -196,6 +197,12 @@ class VideoBlocksManager(ManagerBase):
         self._ctx.overlay_timeout = Settings().get("playlist/overlay_timeout")
         self._ctx.is_drag_ui = False
 
+        # kept apart from is_disable_overlay, which is the viewer's own
+        # switch and is what the menu's tick reads
+        self._ctx.is_overlay_suppressed = False
+
+        self._align_dialog = None
+
         self._ctx.video_blocks = VideoBlocks()
 
         self._live_video_blocks = 0
@@ -227,6 +234,7 @@ class VideoBlocksManager(ManagerBase):
             "is_any_videos_have_bookmarks": self.is_any_videos_have_bookmarks,
             "is_seek_sync_mode_set_to": self.is_seek_sync_mode_set_to,
             "set_seek_sync_mode": self.set_seek_sync_mode,
+            "align_videos": self.cmd_align_videos,
             "reload_all": self.reload_videos,
             "is_disable_mouse_click_events": lambda: (
                 self._ctx.is_disable_mouse_click_events
@@ -394,6 +402,137 @@ class VideoBlocksManager(ManagerBase):
         if self._ctx.seek_sync_mode == SeekSyncMode.TIMECODE:
             self.all_seek.emit(timecode)
 
+    def seek_sync_offset(self, source_id, time_ms, is_paused=None):
+        """Carry a seek to the other videos through the offsets they hold.
+
+        Each goes to the moment the source is on, read against its own sync
+        offset rather than to the source's own time: the offsets are what say
+        where one moment lies in each recording. A video holding nothing
+        there says so instead; see VideoBlock.apply_sync_position.
+
+        The pause state comes from the source unless one is named, which is
+        how starting playback hands over the state it is moving to rather
+        than the one it is leaving.
+        """
+
+        source = self._sync_offset_source(source_id)
+
+        if source is None:
+            return
+
+        if is_paused is None:
+            is_paused = source.video_params.is_paused
+
+        common_ms = time_ms - source.sync_offset_ms
+
+        for vb in self._ctx.video_blocks:
+            if vb is source:
+                continue
+
+            vb.apply_sync_position(vb.sync_offset_ms + common_ms, is_paused)
+
+    def seek_sync_playback(self, source_id, is_paused):
+        """Start or stop every lined-up video along with the one asked.
+
+        They have to run together: one carrying on while the rest sit where
+        they were leaves them a minute apart within a minute, whatever the
+        offsets say.
+
+        Starting sends them all to the moment the source is on first, so a
+        run begins lined up rather than wherever the last one left them. It
+        goes through the same call a seek does, which is what keeps a video
+        with nothing at that moment saying so and staying held rather than
+        being started from the end it ran out at.
+        """
+
+        source = self._sync_offset_source(source_id)
+
+        if source is None:
+            return
+
+        if is_paused:
+            self.set_pause.emit(True)
+            return
+
+        self.seek_sync_offset(source_id, source.time, is_paused=False)
+
+    def _sync_offset_source(self, source_id):
+        """The video a seek or a playback change came from, where it counts.
+
+        Nothing comes of it in any other mode: the offsets are only what the
+        videos are lined up by while OFFSET is the one in force.
+        """
+
+        if self._ctx.seek_sync_mode != SeekSyncMode.OFFSET:
+            return None
+
+        return self._ctx.video_blocks.by_id(source_id)
+
+    def cmd_align_videos(self):
+        if self._align_dialog is not None:
+            self._align_dialog.raise_()
+            self._align_dialog.activateWindow()
+            return
+
+        dialog = AlignVideosDialog(
+            self._ordered_video_blocks,
+            is_offset_mode=self._is_offset_mode,
+            parent=self.parent(),
+        )
+
+        self._align_dialog = dialog
+        self._set_overlay_suppressed(True)
+
+        def restore(*_args):
+            # a dialog opened after this one was closed owns the overlays
+            # now, and this one coming down is none of its business
+            if self._align_dialog is not dialog:
+                return
+
+            self._align_dialog = None
+            self._set_overlay_suppressed(False)
+
+        dialog.finished.connect(restore)
+        # finished is not certain for a dialog that is not modal; being
+        # deleted is, since it closes that way
+        dialog.destroyed.connect(restore)
+
+        dialog.show()
+
+    def _set_overlay_suppressed(self, is_suppressed):
+        """Stand the cell overlays down while something covers the videos.
+
+        An overlay of a cell is a window of its own: it stays above the
+        window the videos are in and takes presses without taking focus, so
+        anything shown over a cell has its buttons where an overlay is and
+        never hears the press. It is the videos that are being looked at
+        while aligning, so nothing is lost by their chrome going.
+        """
+
+        self._ctx.is_overlay_suppressed = is_suppressed
+
+        if is_suppressed:
+            self.hide_overlay.emit()
+            return
+
+        self.show_overlay.emit()
+
+    def _is_offset_mode(self):
+        return self._ctx.seek_sync_mode == SeekSyncMode.OFFSET
+
+    def _ordered_video_blocks(self):
+        """Every video, in the order they are laid out to be read down."""
+
+        ordered = self._ctx.video_blocks.blocks_for_ids(
+            self._ctx.commands.layout_order()
+        )
+
+        # one not in the layout yet -- still loading in, or added as the
+        # dialog opened -- is better listed at the end than not at all
+        listed = {block.id for block in ordered}
+
+        return [*ordered, *(b for b in self._ctx.video_blocks if b.id not in listed)]
+
     def is_seek_sync_mode_set_to(self, mode):
         return self._ctx.seek_sync_mode == mode
 
@@ -557,6 +696,8 @@ class VideoBlocksManager(ManagerBase):
             (vb.is_paused_change, self.playing_count_change),
             (vb.sync_percent, self.seek_sync_percent),
             (vb.sync_time, self.seek_sync_timecode),
+            (vb.sync_offset, self.seek_sync_offset),
+            (vb.sync_playback, self.seek_sync_playback),
             (vb.sync_percent_single, self.all_seek_percent),
             (vb.sync_time_single, self.all_seek),
             (vb.sync_paused, self.set_pause),

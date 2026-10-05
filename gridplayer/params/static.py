@@ -201,6 +201,11 @@ class SeekSyncMode(AutoName):
     DISABLED = auto()
     PERCENT = auto()
     TIMECODE = auto()
+    # Seeks are carried to the other videos through the sync offset each one
+    # holds, rather than to the same time or the same percent of the length:
+    # the point is that the recordings are of the same thing, not that they
+    # are the same length or begin together
+    OFFSET = auto()
 
 
 class UnsavedChangesMode(AutoName):

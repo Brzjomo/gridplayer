@@ -921,6 +921,55 @@ ACTIONS = MappingProxyType(
             "func": ("active", "sync_others_time"),
             "show_if": "is_active_seekable",
         },
+        # Sync Offset: lining recordings up that begin at different times.
+        # The offset is the point on this video's own timeline that a common
+        # reference moment falls on, so shifting it forward moves this video
+        # further along for the same moment on every other one.
+        "Sync Offset: %v": {
+            "title": "{}: %v".format(translate("Actions", "Offset")),
+            "icon": "seek-sync",
+            "func": ("active", "sync_offset_dialog"),
+            "value_getter": ("active", "get_sync_offset_txt"),
+            "show_if": "is_active_seekable",
+        },
+        "Set Sync Point Here": {
+            "title": translate("Actions", "Set Sync Point Here"),
+            "icon": "checkmark",
+            "func": ("active", "set_sync_point_here"),
+            "show_if": "is_active_seekable",
+        },
+        "Shift Sync Point Forward By One Frame": {
+            "title": translate("Actions", "Forward By One Frame"),
+            "icon": "next-frame",
+            "func": ("active", "sync_offset_shift_frames", 1),
+            "show_if": "is_active_seekable",
+            "enable_if": "is_active_offset_in_frames",
+        },
+        "Shift Sync Point Back By One Frame": {
+            "title": translate("Actions", "Back By One Frame"),
+            "icon": "previous-frame",
+            "func": ("active", "sync_offset_shift_frames", -1),
+            "show_if": "is_active_seekable",
+            "enable_if": "is_active_offset_in_frames",
+        },
+        "Shift Sync Point Forward By One Second": {
+            "title": translate("Actions", "Forward By One Second"),
+            "icon": "seek-plus-1",
+            "func": ("active", "sync_offset_shift_ms", 1000),
+            "show_if": "is_active_seekable",
+        },
+        "Shift Sync Point Back By One Second": {
+            "title": translate("Actions", "Back By One Second"),
+            "icon": "seek-minus-1",
+            "func": ("active", "sync_offset_shift_ms", -1000),
+            "show_if": "is_active_seekable",
+        },
+        "Sync Offset Reset": {
+            "title": translate("Actions", "Offset Reset"),
+            "icon": "reset",
+            "func": ("active", "sync_offset_reset"),
+            "show_if": "is_active_seekable",
+        },
         "Stream Quality": {
             "title": translate("Actions", "Stream Quality"),
             "icon": "stream-quality",
@@ -1939,6 +1988,18 @@ ACTIONS = MappingProxyType(
             "icon": "seek-sync-time",
             "func": ("set_seek_sync_mode", SeekSyncMode.TIMECODE),
             "check_if": ("is_seek_sync_mode_set_to", SeekSyncMode.TIMECODE),
+        },
+        "Seek Sync (Offset)": {
+            "title": translate("Seek Sync", "Sync Offset"),
+            "icon": "seek-sync",
+            "func": ("set_seek_sync_mode", SeekSyncMode.OFFSET),
+            "check_if": ("is_seek_sync_mode_set_to", SeekSyncMode.OFFSET),
+        },
+        "Align Videos…": {
+            "title": translate("Actions", "Align Videos…"),
+            "icon": "seek-sync",
+            "func": "align_videos",
+            "show_if": "is_more_than_one_video",
         },
         "Shuffle Grid": {
             "title": translate("Actions", "Shuffle"),
