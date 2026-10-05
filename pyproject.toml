@@ -68,7 +68,11 @@ dev = [
 module-root = ""
 
 [tool.ruff]
-extend-exclude = ["gridplayer/vlc_player/vlc.py"]
+# vlc.py is vendored. dev_docs is prose: its Python blocks are excerpts,
+# often elided or deliberately out of context, and formatting them rewrites
+# them into something the code they came from never said. Markdown is
+# rumdl's to keep, below.
+extend-exclude = ["gridplayer/vlc_player/vlc.py", "dev_docs"]
 force-exclude = true
 
 [tool.ruff.format]
