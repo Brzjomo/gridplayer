@@ -185,6 +185,27 @@ builds succeeding.
 * **Translation timing.** `tests/test_translation_timing.py` guards it, but the
   failure mode is subtle: a module-level `translate()` bakes in English
   permanently, and this is how every menu entry once came out in English.
+* **New UI is English until the next translation round.** `.ts` files are
+  managed on Crowdin and are never edited here, so a string added to the source
+  shows in English in every language until somebody runs the translation update
+  ([build-and-release.md](build-and-release.md), `scripts/translations/`).
+  Measured when the alignment dialog was reworked: **no `.ts` in the tree
+  contains the `Dialog - Align Videos` context at all**, so that whole dialog —
+  every label, button and note — is English in every language, including the
+  ones that are otherwise fully translated. Its 46 strings are extractable now
+  (`pylupdate5`, checked), which is the precondition for the round picking them
+  up at all.
+* **Strings the extractor cannot see.** `pylupdate5` reads a call's text only
+  where that text *begins on the same line as the context*. `ruff format` splits
+  any call that does not fit on one line, which puts the text on the next line,
+  and Python's own joining of adjacent literals hides the difference from every
+  other check. Measured over the package: **100 call sites were like that** —
+  including the whole of the settings form (`params/defaults_fields.py`, 18) and
+  the network checkups (27) — each of them a string no translator would ever be
+  given. The alignment dialog's 18 were fixed with the recipe now in `AGENTS.md`
+  (statement of its own + `# fmt: skip` on its last line); **82 remain**, held
+  against growth by `tests/test_translation_extraction.py`. Sweeping them is a
+  mechanical change of its own, worth doing before the next translation round.
 * **The command namespace is global.** A new manager's `commands` name colliding
   with an existing one raises `ValueError` at startup — good, but it means command
   names must be chosen with global uniqueness in mind.

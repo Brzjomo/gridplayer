@@ -11,6 +11,7 @@ is written for people changing the **code**.
 | --- | --- |
 | Get a mental model of the whole program | [architecture.md](architecture.md) |
 | Run it, test it, lint it, debug it | [development.md](development.md) |
+| Run the app or the suite from a clone, in one command | [run-and-test.md](run-and-test.md) |
 | Understand startup, argv, single instance | [boot-and-lifecycle.md](boot-and-lifecycle.md) |
 | Add a menu item, shortcut or command | [commands-and-actions.md](commands-and-actions.md) |
 | Add or change a setting | [settings-system.md](settings-system.md) |

@@ -9,7 +9,7 @@ How to get a working checkout, run the thing, and debug it.
 | **Python 3.10+** | running at all | `requires-python = ">=3.10"` in `pyproject.toml`. CI tests 3.10 and 3.14. |
 | **uv** | dependency management | `uv sync`, `uv run`. |
 | **just** | task runner | `just generate-ui`, `just build-*`. Not required for plain development. |
-| **VLC** | playback | System VLC on Windows/macOS; `libvlc5`/`vlc-plugin-base` on Linux. The app refuses to start without it. |
+| **VLC** | playback, and the VLC-backed tests | System VLC on Windows/macOS; `libvlc5`/`vlc-plugin-base` on Linux. The app refuses to start without it. A VLC that is not installed anywhere can be pointed at by hand — [run-and-test.md](run-and-test.md) is the whole of that. |
 | **Deno / Node / Bun / QuickJS** | YouTube links only | Optional. See `README.md` → *JavaScript runtime*. |
 
 This checkout has `uv` and Python 3.10.19 on `PATH`, but **not** `just` and **not**
@@ -26,6 +26,11 @@ uv run gridplayer             # run from source
 `uv run` uses the project environment without activating it. If you prefer an
 activated shell, `uv venv` + `.venv\Scripts\activate` (Windows) or
 `source .venv/bin/activate` works too.
+
+On Windows, `scripts\run_dev.cmd` does this and finds a VLC to run against —
+installed, unpacked or pointed at with `GRIDPLAYER_VLC_DIR`. It also runs the
+suite (`scripts\run_dev.cmd --tests`). See [run-and-test.md](run-and-test.md)
+for the order it looks in and what it promises.
 
 ## Running the app
 

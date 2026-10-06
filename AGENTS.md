@@ -21,6 +21,11 @@ uv run ruff check .
 uv run ruff format --check .
 ```
 
+On Windows, `scripts\run_dev.cmd` runs the app (`scripts\run_dev.cmd`) or the
+suite (`scripts\run_dev.cmd --tests`) against the VLC the machine has, without
+setting anything up first. The order it looks in, and the rules it keeps, are in
+`dev_docs/run-and-test.md`.
+
 ## UI files
 
 Files matching `*_ui.py` are generated from Qt Designer `.ui` sources. Never edit them directly. Edit the `.ui` source in `resources/ui` instead, then run:
@@ -45,11 +50,21 @@ Settings().set("playlist/unsaved_changes", UnsavedChangesMode.DISCARD)
 ## Translatable strings
 
 `pylupdate5` only extracts a string when it sees a literal context and a
-literal text in the call itself. Anything else still translates at runtime if
-the entry happens to exist, but never reaches translators.
+literal text in the call itself, **on the same source line**: it reads the
+text only where the text begins beside the context. Python joins adjacent
+literals long before anything else sees them, so a call the formatter has
+wrapped is ordinary code that extracts nothing, in every language, for good.
+`tests/test_translation_extraction.py` holds new files to none of those.
 
 * Always write `translate("Context", "Text")` (or `self.tr("Text")`) with
-  string literals at the call site.
+  string literals at the call site, and **start the text on the context's own
+  line** — wrapping *after* that is fine:
+  `translate("Context", "First part"` / `" and the rest")`.
+* Where that cannot be done in place, because the call is an argument of
+  another call or is chained with `.format(...)`, build the string in a
+  statement of its own first, and hold `ruff format` off with `# fmt: skip`
+  at the end of that statement's last line — a marker on a line of its own is
+  refused by RUF028, and one on an inner line is ignored.
 * Do not add wrapper helpers such as `_t(text)` / `_tr(text)`, and do not pass
   the context through a constant or variable.
 * Do not put `tr()` / `translate()` inside f-strings; translate first, then
@@ -61,6 +76,9 @@ the entry happens to exist, but never reaches translators.
   (`params/defaults_fields.py`) uses one context named after the setting
   (e.g. `Transform`, `When Finished`, `Playlist Settings`). Other menu strings
   use `Actions`; other settings form strings use `SettingsDialog`.
+* Translations themselves are managed externally (Crowdin): new strings are
+  English until a translation round happens, and no `.ts`/`.qm` file is edited
+  here.
 
 ## Code style
 
