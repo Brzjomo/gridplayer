@@ -300,6 +300,50 @@ Related teardown facts, from `tests/test_close_teardown.py`:
 * If `check_playlist_save` returns `False`, `force_close_playlist` and
   `force_terminate` are **not** called.
 
+## Tests that need VLC
+
+A good part of the suite drives code that reaches libVLC, and on a machine
+without VLC installed those tests have to be skipped rather than failed. Two
+patterns, and it is worth knowing which one a file uses:
+
+* **Collect-time import.** Most files import `gridplayer.vlc_player...` at module
+  level, which loads the shared library as the module is imported. On a machine
+  without VLC **the whole file fails to collect** — `pytest` reports it as an
+  error, not as a skip, and `-x` stops there. Nothing can be done about this from
+  inside the file; install VLC (CI installs `libvlc5 vlc-plugin-base` and the GL
+  and font libraries Qt wants offscreen).
+* **A marker, where only some of the file needs it.** Files that mix the two
+  import VLC-using modules *inside* the tests that need them and mark those tests
+  or classes:
+
+  ```python
+  def _has_vlc() -> bool:
+      try:
+          import gridplayer.vlc_player.libvlc  # noqa: F401
+      except Exception:
+          return False
+      return True
+
+  needs_vlc = pytest.mark.skipif(not _has_vlc(), reason="VLC is not installed")
+
+  @needs_vlc
+  class TestTheProbeReadsASnippet:
+      ...
+  ```
+
+  `tests/test_sync_audio.py` and `tests/test_sync_offset.py` are written this
+  way: the arithmetic, the offsets, the dialog and the actions all run without
+  VLC, and only reading sound off a file is skipped. Mark classes and not whole
+  files, and only where the VLC import is really reached — a class of pure
+  arithmetic under a `needs_vlc` mark is coverage thrown away on every machine
+  that has no VLC.
+
+  Where a test needs a recording to read, it writes a **temporary wav** with
+  `wave` (`_write_clicks`, `_write_irregular_bursts` in `test_sync_audio.py`)
+  rather than shipping a media file: bursts of known lengths at known moments
+  say what the reading should have come back with, and the same file can be read
+  from two positions to measure the error of the whole path.
+
 ## What to test when you change something
 
 | Change | Minimum coverage |
@@ -312,6 +356,8 @@ Related teardown facts, from `tests/test_close_teardown.py`:
 | Stream resolution | `tests/test_resolver_yt_dlp_*.py`, `tests/test_url_resolve_worker.py`. |
 | The proxy | A `tests/test_stream_proxy_*.py` test with a real localhost server. |
 | Grid/drop behaviour | `tests/test_grid_layout.py`, `tests/test_managers_grid.py`, `tests/test_drag_n_drop.py`. |
+| Anything in the sound of a recording, or in lining recordings up | `tests/test_sync_audio.py` (the arithmetic, the cache of what was read, placing a reading on the clock, and the pairing up of several readings). |
+| The alignment dialog, offsets, a seek carried between videos, or the envelope strips | `tests/test_sync_offset.py`. |
 | Anything touching a `translate()` call site | `tests/test_translation_timing.py` must still pass. |
 
 The suite has a test file per feature area, so the fastest way to find the right

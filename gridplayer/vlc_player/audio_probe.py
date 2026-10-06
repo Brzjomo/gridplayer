@@ -13,17 +13,21 @@ at the samples and both are worse:
 
 This player has no window, no interface and nothing to send its sound to.
 It is asked for a few seconds around a moment and left to get on with it.
+
+What it writes is kept by `SnippetCache`, so a second reading of the same
+recording -- which is what moving the videos about and lining them up again
+comes to -- reads the sound off the file rather than decoding it again.
 """
 
 import logging
-import tempfile
 import time
 from pathlib import Path
 
 from gridplayer.utils.log_config import DISABLED
 from gridplayer.utils.sync_audio import (
     SAMPLE_RATE,
-    envelope_from_wav,
+    SnippetCache,
+    file_key,
 )
 from gridplayer.vlc_player.libvlc import vlc
 
@@ -45,6 +49,15 @@ POLL_SEC = 0.02
 # The player's own state, once it has nothing left to do.
 FINISHED_STATES = (vlc.State.Ended, vlc.State.Stopped)
 
+# One cache of read stretches for the whole application: a probe is made
+# for every run of readings, and what makes the keeping worth anything is
+# that the next run finds what the last one read.
+_envelope_cache = SnippetCache()
+
+
+def envelope_cache() -> SnippetCache:
+    return _envelope_cache
+
 
 def _sout(dst: Path) -> str:
     """The stream output that writes the snippet out as a wav.
@@ -63,8 +76,13 @@ def _sout(dst: Path) -> str:
 class AudioProbe:
     """A player kept for reading snippets, and never heard."""
 
-    def __init__(self):
+    def __init__(self, cache: SnippetCache | None = None):
         self._instance = None
+
+        # the same stretches across probes, since a probe is made for every
+        # run of readings and the point of keeping them is to have them the
+        # next time somebody lines the videos up
+        self._cache = cache if cache is not None else envelope_cache()
 
     @property
     def instance(self):
@@ -108,20 +126,22 @@ class AudioProbe:
         moment, which runs at a few hundred times the length of what it is
         decoding, and is the price of the first block beginning somewhere
         that is known: at the start of the recording.
+
+        What has been decoded once is kept, so the cost is paid the first
+        time a recording is read and not on every reading of it: see
+        SnippetCache.
         """
 
         origin_ms = max(0, int(center_ms) - snippet_ms // 2)
-        until_ms = origin_ms + snippet_ms
 
-        with tempfile.TemporaryDirectory(prefix="gridplayer-probe-") as tmp:
-            dst = Path(tmp) / "probe.wav"
+        envelope = self._cache.envelope(
+            file_key(uri),
+            origin_ms,
+            snippet_ms,
+            lambda until_ms, dst: self._write_snippet(uri, until_ms, dst),
+        )
 
-            if not self._write_snippet(uri, until_ms, dst):
-                return (), origin_ms
-
-            envelope = envelope_from_wav(dst, from_ms=origin_ms, span_ms=snippet_ms)
-
-            return envelope, origin_ms
+        return envelope, origin_ms
 
     def _write_snippet(self, uri, until_ms: int, dst: Path) -> bool:
         instance = self.instance

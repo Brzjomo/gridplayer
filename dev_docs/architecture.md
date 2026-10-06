@@ -196,12 +196,30 @@ covers things you must be able to do *while* loading or after a network error
 that should work on a video stuck in an error state, **add its command name to
 `LOADING_COMMANDS`**, or it will be dropped before it ever reaches the widget.
 
+## Lining recordings up by sound
+
+The one part of the program that is not about playing anything. It is small, has
+no Qt and no VLC in its middle, and is documented properly in
+[audio-alignment.md](audio-alignment.md); what belongs here is where it sits.
+
+| File | Role |
+| --- | --- |
+| `dialogs/align_videos.py` | The dialog: a row per video, and **Align By Sound**. Asks for a reading per video and applies what comes back. |
+| `widgets/sync_strip.py` | The sound of one video drawn over the reference's, against the clock the records are meant to share: the eye's fallback where the numbers are not to be trusted. |
+| `utils/sync_align.py` | `AlignMeasure`: reading every video's sound on a `QThread`, one signal with all the readings at the end. |
+| `vlc_player/audio_probe.py` | A player of its own, with no window and a dummy audio output, transcoding a stretch of a recording into a wav file. `AudioProbe.envelope()` is the only thing here that needs VLC. |
+| `utils/sync_audio.py` | All of the arithmetic: samples in, a lag out, plus the cache of stretches already read (`SnippetCache`), the wav reading, and `Sound` (a reading placed by an offset). Touches neither VLC nor Qt, which is why most of its tests need no player. |
+
+Nothing here shares a player with the grid. A player given audio callbacks has no
+output left to give the sound to, so analysing what is being played would take
+the sound away from the viewer; a second player, with `--aout=dummy`, does not.
+
 ## Threading model
 
 | Thread | What runs there |
 | --- | --- |
 | Qt main thread | All widgets, all managers, all dialog interaction, VLC event handling for in-process players. |
-| Worker `QThread`s | URL resolution (`utils/url_resolve/url_resolve.py`), network checkups, thumbnail/screenshot work. They hand results back by signal. |
+| Worker `QThread`s | URL resolution (`utils/url_resolve/url_resolve.py`), network checkups, thumbnail/screenshot work, and reading a video's sound for the alignment dialog (`utils/sync_align.py`). They hand results back by signal. |
 | `single_instance.Listener` thread | A daemon thread accepting connections on the instance socket; emits `open_files` into the main thread. |
 | Child **processes** | The default decoder mode. One process per `VideoFrameVLC*`, each running its own `vlc_player.Player`; the main process talks to them over stdio. |
 | `stream_proxy` server thread | The local HTTP server, when the proxy is active. |
