@@ -167,7 +167,7 @@ Notable details:
   copying **only the plugin directories VLC needs** — access, audio_filter,
   audio_mixer, codec, demux, misc, packetizer, stream_filter, video_chroma,
   video_output, d3d9, d3d11, plus one audio output (directsound).
-* Two plugins get an explicit comment because their absence is silent:
+* Three plugins get an explicit comment because their absence is silent:
 
   > Subtitles need both of these, and neither says so when it is missing: the
   > track is decoded and selected, and nothing is ever drawn. blend composites
@@ -175,13 +175,30 @@ Notable details:
 
   Along with `video_filter/libtransform_plugin.dll` (for the transform
   features) and `text_renderer` (freetype, for text subtitles).
+* Reading a snippet of sound — what **Align By Sound** does — needs three more:
+  `stream_out` (the `#transcode` and `#std` modules that write the snippet),
+  `mux/libmux_wav_plugin.dll` (the wav it is written as) and
+  `access_output/libaccess_output_file_plugin.dll` (the file it is written to).
+  None of the three is needed to play a video, and **leaving out any one of
+  them was measured to leave the probe reading nothing at all** in a payload
+  built from this script's own list, with the dialog saying nothing about it.
 * Runs `vlc-cache-gen.exe` to build `plugins.dat`, which is why
-  `InstanceVLC.init_options` can add `--no-plugins-scan` when it exists.
+  `InstanceVLC.init_options` can add `--no-plugins-scan` — but only when the
+  cache is a real one: a cache written for an empty directory is 24 bytes, and
+  the app then tells VLC not to look for plugins it does not have, so **no
+  video plays at all** while everything else about the app looks healthy.
+  `MIN_PLUGIN_CACHE_BYTES` (`vlc_player/instance.py`) is what refuses a stub;
+  `tests/test_vlc_plugin_cache.py` covers it.
 * The whole `libVLC` directory is finally moved into `dist/$APP_NAME/libVLC`,
   which is exactly where `libvlc._get_embed_vlc_root` looks for a frozen build.
 
 **If you add a VLC feature that needs a plugin, add its directory to this list.**
 The failure mode is a feature that silently does nothing in shipped builds.
+
+`tests/test_sync_audio.py::TestWhatAPackagedBuildMustCarry` and
+`tests/test_subtitles_are_reachable.py::TestTheBuildsShipWhatDrawsThem` hold the
+list to the script, so dropping one of these lines fails the suite rather than
+the release.
 
 ### macOS
 

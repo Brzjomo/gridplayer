@@ -69,6 +69,24 @@ if [ ! -d "$VLC_EMBED_SRC" ]; then
     # name and cannot be given one. See vlc_player/audio_probe.py.
     cp "$BUILD_DIR"/vlc-*/plugins/audio_output/libadummy_plugin.dll "$VLC_EMBED_SRC/plugins/audio_output"
 
+    # And the rest of that chain, of which the silent output is only one
+    # end. A snippet is written by #transcode into #std, with mux=wav and
+    # access=file, so the stream output modules, the wav muxer and the file
+    # access output are all needed -- and none of the three is needed to
+    # play a video, which is why none of the three was ever here.
+    #
+    # Measured on a payload built from exactly the list below: leaving out
+    # any one of the three directories leaves the probe reading nothing at
+    # all, and Align By Sound doing nothing and saying nothing about it.
+    mkdir -p "$VLC_EMBED_SRC/plugins/access_output"
+    mkdir -p "$VLC_EMBED_SRC/plugins/mux"
+    mkdir -p "$VLC_EMBED_SRC/plugins/stream_out"
+
+    cp "$BUILD_DIR"/vlc-*/plugins/access_output/libaccess_output_file_plugin.dll "$VLC_EMBED_SRC/plugins/access_output"
+    cp "$BUILD_DIR"/vlc-*/plugins/mux/libmux_wav_plugin.dll "$VLC_EMBED_SRC/plugins/mux"
+    cp "$BUILD_DIR"/vlc-*/plugins/stream_out/libstream_out_standard_plugin.dll "$VLC_EMBED_SRC/plugins/stream_out"
+    cp "$BUILD_DIR"/vlc-*/plugins/stream_out/libstream_out_transcode_plugin.dll "$VLC_EMBED_SRC/plugins/stream_out"
+
     cp -a "$BUILD_DIR"/vlc-*/plugins/access "$VLC_EMBED_SRC/plugins"
     cp -a "$BUILD_DIR"/vlc-*/plugins/audio_filter "$VLC_EMBED_SRC/plugins"
     cp -a "$BUILD_DIR"/vlc-*/plugins/audio_mixer "$VLC_EMBED_SRC/plugins"

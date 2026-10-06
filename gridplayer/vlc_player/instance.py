@@ -118,7 +118,7 @@ class InstanceVLC:
 
         self._logger.debug(f"VLC init options: {options}")
 
-        if _is_plugin_cache_exists():
+        if _is_plugin_cache_usable():
             self._logger.debug("Using plugin cache")
             options.append("--no-plugins-scan")
         # https://forum.videolan.org/viewtopic.php?t=147229
@@ -223,13 +223,26 @@ class ProcessManagerVLC(ProcessManager):
         return instance
 
 
-def _is_plugin_cache_exists() -> bool:
+# A cache of the plugins is written by `vlc-cache-gen.exe` at build time,
+# and one written for a directory with no plugins in it is 24 bytes --
+# measured. Taken for a cache, it has the app ask VLC not to scan the
+# plugin directory, and VLC then has no plugins at all: every decoder
+# process fails to start with "VLC failed to initialize", and nothing says
+# why. The plugin set a release ships comes to about 200 KB, so anything
+# this small is a stub and not a cache.
+MIN_PLUGIN_CACHE_BYTES = 1024
+
+
+def _is_plugin_cache_usable() -> bool:
     if vlc.plugin_path is None:
         return False
 
-    plugin_cache_path = Path(vlc.plugin_path) / "plugins.dat"
-
-    return plugin_cache_path.is_file()
+    try:
+        return (Path(vlc.plugin_path) / "plugins.dat").stat().st_size >= (
+            MIN_PLUGIN_CACHE_BYTES
+        )
+    except OSError:
+        return False
 
 
 def _subtitle_style_options() -> list[str]:

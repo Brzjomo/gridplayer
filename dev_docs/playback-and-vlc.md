@@ -156,7 +156,9 @@ list in a deliberate order:
   * user options from misc/vlc_options
 ```
 
-plus `--no-plugins-scan` when `plugins.dat` exists, `--aout=directsound` on
+plus `--no-plugins-scan` when there is a usable `plugins.dat` (meaning one
+larger than `MIN_PLUGIN_CACHE_BYTES` — a stub cache is worse than none, see
+[build-and-release.md](build-and-release.md)), `--aout=directsound` on
 Windows, certifi trust options on Windows 7, `--aout=pulse` on AppImage, and
 `--vout=vdummy` for the software decoder instances.
 
