@@ -341,6 +341,18 @@ loudness alone scores below the threshold; the real recordings score 0.34, the
 synthetic fixture 0.70. The assertion was deleted rather than the fixture bent
 until it agreed.
 
+**A build venv can hold the right packages for the wrong Python.** A
+`build/venv-pyinstaller` whose interpreter was 3.12 held PyQt5 built for 3.11 --
+`sip.cp311-win_amd64.pyd` sits in a 3.12 `site-packages` and is never importable
+there. `pip install -r requirements.txt` cannot catch that: the wheel is simply
+present under the wrong ABI tag. PyInstaller cannot catch it either, and that is
+the dangerous part: it collects no `sip` module, reports no error, and the
+finished package goes looking for Qt and dies with `ModuleNotFoundError: No
+module named 'PyQt5.sip'` -- after a build that printed nothing but INFO lines,
+and only when somebody runs the artifact. Every build now asks the venv to
+import `PyQt5.QtCore` and `PyQt5.sip` before anything is frozen with it
+(`check_pyqt`), which takes a second and names the directory to remove.
+
 **A bound that is right at one size of reading is wrong at the other.** The
 overlap between two readings at a lag was worked out as `reference[:len - lag]`
 against `other[lag:]`, which is exactly right while the two readings are the same

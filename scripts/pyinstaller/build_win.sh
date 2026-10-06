@@ -34,6 +34,8 @@ fi
 pip install -r "$REQUIREMENTS"
 pip install pyinstaller=="$PYINSTALLER_VERSION"
 
+check_pyqt "$BUILD_DIR/venv-pyinstaller"
+
 # Copy icons to build dir
 cp "$RESOURCES_DIR/icons/main/sys/windows.ico" "$BUILD_DIR/main.ico"
 cp "$RESOURCES_DIR/icons/playlist/sys/windows.ico" "$BUILD_DIR/mime.ico"
@@ -45,6 +47,10 @@ copy_with_app_vars "$SCRIPT_DIR/pyinstaller_win.spec" "$BUILD_DIR/$APP_NAME.spec
 
 pyinstaller --clean --noconfirm "$BUILD_DIR/$APP_NAME.spec"
 
+if [ ! -d "$DIST_DIR/$APP_NAME" ]; then
+    die "PyInstaller left no $DIST_DIR/$APP_NAME to put VLC into"
+fi
+
 # Post-build
 # =============
 
@@ -53,7 +59,12 @@ echo "Embedding VLC"
 VLC_EMBED_SRC=$(realpath "$BUILD_DIR/libVLC")
 
 if [ ! -d "$VLC_EMBED_SRC" ]; then
-    wget -q -nc -O "$BUILD_DIR/vlc.zip" "$VLC_URL" || true
+    download "$VLC_URL" "$BUILD_DIR/vlc.zip"
+
+    if [ ! -s "$BUILD_DIR/vlc.zip" ]; then
+        die "no VLC to embed: put $VLC_URL at $BUILD_DIR/vlc.zip and run this again"
+    fi
+
     unzip -oq "$BUILD_DIR/vlc.zip" -d "$BUILD_DIR"
 
     mkdir -p "$VLC_EMBED_SRC/plugins"
@@ -119,6 +130,12 @@ if [ ! -d "$VLC_EMBED_SRC" ]; then
     cp -a "$BUILD_DIR"/vlc-*/libvlccore.dll "$VLC_EMBED_SRC"
 fi
 
-if [ ! -d "$DIST_DIR/$APP_NAME/libVLC" ]; then
-    mv "$VLC_EMBED_SRC" "$DIST_DIR/$APP_NAME/libVLC"
-fi
+# Copied rather than moved: preparing it is the slow half of a build -- 83 MB
+# downloaded, unpacked, a plugin cache built -- and a dist that has been wiped
+# is no reason to do all of that again. A second build therefore skips the
+# whole block above and only puts the plugins in place.
+VLC_DEST="$DIST_DIR/$APP_NAME/libVLC"
+
+[ -d "$VLC_DEST" ] && rm -rf "$VLC_DEST"
+
+cp -a "$VLC_EMBED_SRC" "$VLC_DEST"

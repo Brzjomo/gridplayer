@@ -6,6 +6,11 @@ imports, so a checkout needs a library **and** its plugin directory pointed at
 it before anything runs, and both the app and the VLC-backed tests need the
 same two variables set the same way.
 
+`scripts/build_win.cmd` is its opposite number for packaging: one command that
+finds the Git Bash the build scripts are written in and runs them, needing
+nothing installed but Git, Python and `uv`. See
+[build-and-release.md](build-and-release.md).
+
 Read together with [development.md](development.md), which is how the app is
 run and debugged in general, and [testing.md](testing.md), which is what the
 suite expects of the machine it runs on.

@@ -114,6 +114,7 @@ export PIP_NO_BINARY="pydantic"
 pip install -r "$BUILD_DIR/requirements.txt"
 pip install pyinstaller=="$PYINSTALLER_VERSION"
 assert_target_dependency_arch
+check_pyqt "$BUILD_DIR/venv-pyinstaller-$APP_TARGET_ARCH"
 
 # Copy icons to build dir
 cp "$RESOURCES_DIR/icons/main/sys/macos.icns" "$BUILD_DIR/main.icns"
@@ -134,7 +135,11 @@ VLC_EMBED_SRC=$(realpath "$BUILD_DIR")/libVLC-$APP_TARGET_ARCH
 VLC_DMG="$BUILD_DIR/vlc-$APP_TARGET_ARCH.dmg"
 
 if [ ! -d "$VLC_EMBED_SRC" ]; then
-    wget -q -nc -O "$VLC_DMG" "$VLC_URL" || true
+    download "$VLC_URL" "$VLC_DMG"
+
+    if [ ! -s "$VLC_DMG" ]; then
+        die "no VLC to embed: put $VLC_URL at $VLC_DMG and run this again"
+    fi
 
     hdiutil attach "$VLC_DMG"
 

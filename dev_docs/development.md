@@ -8,7 +8,7 @@ How to get a working checkout, run the thing, and debug it.
 | --- | --- | --- |
 | **Python 3.10+** | running at all | `requires-python = ">=3.10"` in `pyproject.toml`. CI tests 3.10 and 3.14. |
 | **uv** | dependency management | `uv sync`, `uv run`. |
-| **just** | task runner | `just generate-ui`, `just build-*`. Not required for plain development, and needed for anything else — how to get it, and the rest of a Windows build toolchain, is in [build-and-release.md](build-and-release.md). |
+| **just** | task runner | `just generate-ui`, `just build-*`. Not required for plain development, and not required for a Windows build either — `scripts\build_win.cmd` runs the same two scripts. The rest of that toolchain is in [build-and-release.md](build-and-release.md). |
 | **VLC** | playback, and the VLC-backed tests | System VLC on Windows/macOS; `libvlc5`/`vlc-plugin-base` on Linux. The app refuses to start without it. A VLC that is not installed anywhere can be pointed at by hand — [run-and-test.md](run-and-test.md) is the whole of that. |
 | **Deno / Node / Bun / QuickJS** | YouTube links only | Optional. See `README.md` → *JavaScript runtime*. |
 

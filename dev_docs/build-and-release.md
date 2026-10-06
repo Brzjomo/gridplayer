@@ -92,51 +92,45 @@ snapshot has no tag of its own.
 
 ### Windows: getting the toolchain
 
-The recipes call the Bash scripts directly, so on Windows they have to run **from
-Git Bash** (`C:\Program Files\Git\bin\bash.exe`) — not from PowerShell, and not
-from the `bash.exe` in `System32`, which is WSL: the scripts use `cygpath`,
-`realpath` and Windows drive paths, and WSL's bash has none of them.
+**Nothing to install but Git, Python and uv.** The recipes call the Bash scripts
+directly, so on Windows they have to run **from Git Bash**
+(`C:\Program Files\Git\bin\bash.exe`) — not from PowerShell, and not from the
+`bash.exe` in `System32`, which is WSL: the scripts use `cygpath`, `realpath`
+and Windows drive paths, and WSL's bash has none of them. `scripts\build_win.cmd`
+finds that bash and runs the two scripts for you, which is the whole of a build:
 
-| Tool | How |
-| --- | --- |
-| `just` | `choco install just`, `scoop install just`, or `cargo install just`. **Optional**: `just build-win-package` is `./scripts/pyinstaller/build_win.sh` followed by `./scripts/windows/build_packages.sh`, and both can be run by hand |
-| `zip`, `unzip` | `choco install zip`. `unzip` is in Git Bash already, `zip` is not |
-| `wget` | `choco install wget`. Only reached on a build whose `build/vlc.zip` is gone — see below |
-| Inno Setup 6 | `choco install innosetup` |
-| `python3` | see the note below — Git Bash on Windows usually has no `python3` |
-| Python **of the architecture being built** | PyInstaller freezes whatever interpreter runs it, so a 64-bit Python cannot produce the 32-bit package |
-
-`BUILD_ARCH` is how the target is chosen and it is set nowhere else: `win64`
-(what a 64-bit `python` gets by default) or `win32`. It decides which VLC zip is
-downloaded, what the plugin cache is built from, and the suffix both artifacts
-get — so the wrong one produces a package that installs, starts, and then cannot
-load the libVLC sitting next to it.
-
-The build venv is created with `python3 -m venv` (`scripts/init_app_vars.sh:84`),
-and Git Bash on Windows normally has no `python3`: python.org and Anaconda both
-put `python` on `PATH`. Either create it once by hand — the script reuses it —
-or make `python3` resolve in that shell:
-
-```bash
-python -m venv build/venv-pyinstaller      # what init_venv would have done
+```cmd
+scripts\build_win.cmd
 ```
 
-The installer step has one hard-coded path:
-`ISCC="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"` in
-`scripts/windows/build_packages.sh`. Inno Setup 6 anywhere else fails that step
-with nothing in the output saying why, and `dist/` ends up holding the portable
-zip and no `-install.exe`.
+Everything the build used to ask for beyond that has a stand-in that is already
+there, or is optional:
+
+| Asked for | How the build gets it |
+| --- | --- |
+| `just` | Not needed: `just build-win-package` is `scripts/pyinstaller/build_win.sh` then `scripts/windows/build_packages.sh`, and those two run by hand |
+| `wget` | `download()` uses wget where there is one and curl where there is not — Git Bash ships curl |
+| `zip` | `zip_dir()` uses `zip` where there is one and Python's `zipfile` where there is not — Git Bash has no `zip` |
+| `python3` | `build_python()` takes `python3`, `python`, or `uv python find`, in that order. Windows has no `python3`: python.org, the Store and Anaconda all install `python` |
+| Inno Setup 6 | **Optional, and the only thing the installer needs.** Without it the portable build is made and the installer is skipped with a line saying so. `find_iscc()` looks in `$ISCC`, then the two standard install directories, then `PATH` |
+
+`BUILD_ARCH` chooses the target and is set nowhere else: `win64` (what a 64-bit
+`python` gets by default) or `win32`. It decides which VLC zip is downloaded,
+what the plugin cache is built from, and the suffix both artifacts get — so the
+wrong one produces a package that installs, starts, and then cannot load the
+libVLC sitting next to it. `scripts\build_win.cmd win32` passes it through.
 
 ### What a previous build leaves behind
 
 * `build/requirements.txt` is **cached**: `build-requirements` writes it only when
   it is missing, so `just clean` is how a changed dependency is picked up.
-* `build/vlc.zip` and the unpacked `build/vlc-3.0.24` stay, but `build/libVLC` is
-  **moved** into `dist/$APP_NAME/libVLC`, not copied. A second build therefore
-  unpacks the cached zip again, and the download in `build_win.sh` is written
-  `wget ... || true` — which is why a machine with no `wget` still builds, as long
-  as `build/vlc.zip` is there. `just clean` takes that away, and then `wget` is
-  the only way back.
+* `build/vlc.zip`, the unpacked `build/vlc-3.0.24` and the `build/libVLC` the
+  plugin cache is built in all stay. The build **copies** libVLC into
+  `dist/$APP_NAME/libVLC`, so wiping `dist/` costs a copy and not another 83 MB
+  down the wire, another unpack and another cache.
+* `dist/$APP_NAME` is what PyInstaller's `COLLECT` writes, and its absence is
+  what a build without it complains about: `build_packages.sh` says to run the
+  PyInstaller step first rather than failing on a `mkdir` three lines in.
 * `just clean-pyinstaller-dist` empties the directories out of `dist/` and leaves
   the wheels, which is what CI does between the two Windows architectures.
 
@@ -197,7 +191,14 @@ Every build script sources this first. It:
   `.appdata.xml` and the Chocolatey `.nuspec` get real values. **It dies if any
   `APP_*` variable used in a template is empty**, which is the intended
   fail-fast behaviour.
-* Provides `init_venv` / `activate_venv` for build-time virtualenvs.
+* Provides `init_venv` / `activate_venv` for build-time virtualenvs, and the
+  five helpers that keep a build from needing anything installed beyond Git,
+  Python and uv: `build_python` (`python3`, `python`, or `uv python find`),
+  `download` (wget or curl, and a file already there is left alone), `zip_dir`
+  (zip, or Python's `zipfile` where zip keeps directories with no files in
+  them), `find_iscc` (`$ISCC`, the two standard Inno Setup directories, then
+  `PATH`; optional, and only the installer needs it) and `check_pyqt` (see the
+  gotcha at the end of this document).
 
 ### Windows: `scripts/pyinstaller/build_win.sh`
 
@@ -397,6 +398,15 @@ The comment at the top of the file notes the commit-msg hook needs
   `just generate-resources`. The release builds copy it verbatim.
 * **A new VLC-dependent feature may need a plugin added to `build_win.sh`**, or it
   will work in development and silently fail in shipped Windows builds.
+* **A build venv can hold the right packages for the wrong Python**, and the
+  package it freezes then cannot start. Measured: a `build/venv-pyinstaller`
+  whose interpreter was 3.12 held PyQt5 built for 3.11
+  (`sip.cp311-win_amd64.pyd`), so PyInstaller collected no `sip` module, said
+  nothing about it, and the payload died on its first import with
+  `ModuleNotFoundError: No module named 'PyQt5.sip'`. Nothing about the build
+  looked wrong. `check_pyqt` asks the venv to import `PyQt5.QtCore` and
+  `PyQt5.sip` before anything is frozen with it, and dies naming the directory
+  to remove (`rm -rf build/venv-pyinstaller`) — which is the whole fix.
 * **`__app_id__` is load-bearing** — changing it moves user data and breaks
   taskbar/bundle identity.
 * **The build scripts are Bash.** On Windows run them from Git Bash; the `just`

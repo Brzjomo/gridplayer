@@ -5,6 +5,121 @@ die() {
     exit 1
 }
 
+# The interpreter a build is made with.
+#
+# `python3` is the name on macOS and on most Linux distributions, and `python`
+# is the name on Windows: python.org, the Microsoft Store and Anaconda all
+# install that one and nothing else, which is why creating a build venv used to
+# fail on a Windows checkout with a perfectly good Python on PATH.
+build_python() {
+    for candidate in python3 python; do
+        if command -v "$candidate" &> /dev/null; then
+            printf '%s\n' "$candidate"
+            return
+        fi
+    done
+
+    # uv can bring its own, and is how this checkout is run anyway
+    if command -v uv &> /dev/null; then
+        uv python find && return
+    fi
+
+    die "python3 (or python, or uv) is required to build"
+}
+
+# Fetching what a build embeds.
+#
+# Written for wget, which is not on Windows: Git Bash ships curl and no wget,
+# and the Chocolatey package that provides wget is one more thing to install
+# before a Windows build will run. Either downloader will do, and a file that
+# is already there is left alone -- which is what a second build relies on.
+download() {
+    URL="$1"
+    DESTINATION="$2"
+
+    [ -s "$DESTINATION" ] && return 0
+
+    if command -v wget &> /dev/null; then
+        wget -q -O "$DESTINATION" "$URL"
+        return
+    fi
+
+    if command -v curl &> /dev/null; then
+        curl -fsSL -o "$DESTINATION" "$URL"
+        return
+    fi
+
+    die "wget (or curl) is required to download $URL"
+}
+
+# Zipping a directory, keeping the directories inside it.
+#
+# zip is not on Windows either (Git Bash has unzip and no zip), and the
+# portable build is a zip with one empty directory in it -- the data directory
+# it looks for beside the executable -- so the archive has to keep directories
+# that hold no files. Python is what the build is made with and writes exactly
+# that, empty directories included.
+zip_dir() {
+    ARCHIVE="$1"
+    SOURCE="$2"
+
+    if command -v zip &> /dev/null; then
+        (cd "$(dirname "$SOURCE")" && zip -qr "$ARCHIVE" "$(basename "$SOURCE")")
+        return
+    fi
+
+    "$(build_python)" - "$ARCHIVE" "$SOURCE" <<'PYTHON'
+import os
+import sys
+import zipfile
+
+archive, source = sys.argv[1], sys.argv[2]
+parent = os.path.dirname(os.path.abspath(source))
+
+with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zipped:
+    for directory, _dirnames, filenames in os.walk(source):
+        inside = os.path.relpath(directory, parent).replace(os.sep, "/")
+
+        # an entry of its own, so that a directory with nothing in it survives
+        zipped.writestr(inside + "/", "")
+
+        for name in filenames:
+            zipped.write(os.path.join(directory, name), f"{inside}/{name}")
+PYTHON
+}
+
+# Where Inno Setup's compiler is, if the machine has one.
+#
+# Only the installer needs it; the portable build needs nothing. It is not on
+# PATH however it was installed, the usual install is a directory with a space
+# in it, and a per-user or portable copy is somewhere else again -- so the
+# environment gets the first say and the two standard places come after.
+find_iscc() {
+    if [ -n "$ISCC" ]; then
+        [ -x "$ISCC" ] || die "ISCC is set to $ISCC, which is not an executable"
+
+        printf '%s\n' "$ISCC"
+        return 0
+    fi
+
+    for candidate in \
+        "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" \
+        "/c/Program Files/Inno Setup 6/ISCC.exe" \
+        "$LOCALAPPDATA/Programs/Inno Setup 6/ISCC.exe"; do
+        if [ -x "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    if command -v ISCC.exe &> /dev/null; then
+        command -v ISCC.exe
+        return 0
+    fi
+
+    return 1
+}
+
 if ! command -v realpath &> /dev/null; then
     realpath() {
         [[ $1 = /* ]] && echo "$1" || echo "$PWD/${1#./}"
@@ -80,15 +195,19 @@ copy_with_app_vars() {
 init_venv() {
     VENV_DIR="$1"
 
-    if [ ! -d "$VENV_DIR" ]; then
-        python3 -m venv "$VENV_DIR"
-
+    if [ -d "$VENV_DIR" ]; then
         activate_venv "$VENV_DIR"
 
-        python3 -m pip install --upgrade pip
-    else
-        activate_venv "$VENV_DIR"
+        return
     fi
+
+    PYTHON="$(build_python)"
+
+    "$PYTHON" -m venv "$VENV_DIR"
+
+    activate_venv "$VENV_DIR"
+
+    "$PYTHON" -m pip install --upgrade pip
 }
 
 activate_venv() {
@@ -99,6 +218,29 @@ activate_venv() {
     else
         . "$VENV_DIR/bin/activate"
     fi
+}
+
+# What a frozen build has to be able to import, checked before anything is
+# frozen with it.
+#
+# A build venv holding PyQt5 for some other Python -- which is what happens
+# when site-packages is copied between environments, or installed into with
+# another interpreter's pip -- freezes into an application that cannot start:
+# PyInstaller collects no sip module, says nothing about it, and the payload
+# dies on `from PyQt5.QtCore import Qt` with "No module named 'PyQt5.sip'".
+# Asking here is a second, and it names the command that fixes it.
+check_pyqt() {
+    VENV_DIR="$1"
+
+    if [ -f "$VENV_DIR/Scripts/python.exe" ]; then
+        VENV_PYTHON="$VENV_DIR/Scripts/python.exe"
+    else
+        VENV_PYTHON="$VENV_DIR/bin/python"
+    fi
+
+    "$VENV_PYTHON" -c "import PyQt5.QtCore, PyQt5.sip" &> /dev/null && return
+
+    die "the build environment in $VENV_DIR cannot import PyQt5, so anything frozen with it would not start. Remove that directory and run this again: rm -rf \"$VENV_DIR\""
 }
 
 export ROOT_DIR="$(realpath $(pwd))"
