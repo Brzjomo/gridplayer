@@ -22,10 +22,12 @@ uv run gridplayer
 
 ## Local build on Windows
 
+Run these from **Git Bash** (the build scripts are Bash and use `cygpath`).
+
 Install dependencies:
 
 ```bash
-choco install zip innosetup
+choco install just zip innosetup
 ```
 
 Build:
@@ -33,6 +35,16 @@ Build:
 ```bash
 just build-win-package
 ```
+
+That is the 64-bit package on a 64-bit Python. For the 32-bit one, use a 32-bit
+Python and `BUILD_ARCH=win32 just build-win-package` (it has no browser
+impersonation, see [pyproject.toml](pyproject.toml)).
+
+The artifacts land in `dist/`: `GridPlayer-<version>-win64-install.exe`,
+`GridPlayer-<version>-win64-portable.zip`, and the `GridPlayer/` folder
+PyInstaller produced. How to get the toolchain, what `BUILD_ARCH` changes and
+what a previous build leaves behind:
+[dev_docs/build-and-release.md](dev_docs/build-and-release.md).
 
 ## Local build on MacOS
 

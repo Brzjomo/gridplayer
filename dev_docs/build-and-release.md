@@ -90,6 +90,56 @@ snapshot has no tag of its own.
 | `commit-and-tag-version`, `conventional-changelog` | the release workflow |
 | `qttools5-dev-tools` (`lrelease`), `pyuic5`, `pyrcc5` | regenerating resources and UI |
 
+### Windows: getting the toolchain
+
+The recipes call the Bash scripts directly, so on Windows they have to run **from
+Git Bash** (`C:\Program Files\Git\bin\bash.exe`) — not from PowerShell, and not
+from the `bash.exe` in `System32`, which is WSL: the scripts use `cygpath`,
+`realpath` and Windows drive paths, and WSL's bash has none of them.
+
+| Tool | How |
+| --- | --- |
+| `just` | `choco install just`, `scoop install just`, or `cargo install just`. **Optional**: `just build-win-package` is `./scripts/pyinstaller/build_win.sh` followed by `./scripts/windows/build_packages.sh`, and both can be run by hand |
+| `zip`, `unzip` | `choco install zip`. `unzip` is in Git Bash already, `zip` is not |
+| `wget` | `choco install wget`. Only reached on a build whose `build/vlc.zip` is gone — see below |
+| Inno Setup 6 | `choco install innosetup` |
+| `python3` | see the note below — Git Bash on Windows usually has no `python3` |
+| Python **of the architecture being built** | PyInstaller freezes whatever interpreter runs it, so a 64-bit Python cannot produce the 32-bit package |
+
+`BUILD_ARCH` is how the target is chosen and it is set nowhere else: `win64`
+(what a 64-bit `python` gets by default) or `win32`. It decides which VLC zip is
+downloaded, what the plugin cache is built from, and the suffix both artifacts
+get — so the wrong one produces a package that installs, starts, and then cannot
+load the libVLC sitting next to it.
+
+The build venv is created with `python3 -m venv` (`scripts/init_app_vars.sh:84`),
+and Git Bash on Windows normally has no `python3`: python.org and Anaconda both
+put `python` on `PATH`. Either create it once by hand — the script reuses it —
+or make `python3` resolve in that shell:
+
+```bash
+python -m venv build/venv-pyinstaller      # what init_venv would have done
+```
+
+The installer step has one hard-coded path:
+`ISCC="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"` in
+`scripts/windows/build_packages.sh`. Inno Setup 6 anywhere else fails that step
+with nothing in the output saying why, and `dist/` ends up holding the portable
+zip and no `-install.exe`.
+
+### What a previous build leaves behind
+
+* `build/requirements.txt` is **cached**: `build-requirements` writes it only when
+  it is missing, so `just clean` is how a changed dependency is picked up.
+* `build/vlc.zip` and the unpacked `build/vlc-3.0.24` stay, but `build/libVLC` is
+  **moved** into `dist/$APP_NAME/libVLC`, not copied. A second build therefore
+  unpacks the cached zip again, and the download in `build_win.sh` is written
+  `wget ... || true` — which is why a machine with no `wget` still builds, as long
+  as `build/vlc.zip` is there. `just clean` takes that away, and then `wget` is
+  the only way back.
+* `just clean-pyinstaller-dist` empties the directories out of `dist/` and leaves
+  the wheels, which is what CI does between the two Windows architectures.
+
 ## Build recipes
 
 All from the `justfile`:
@@ -150,6 +200,10 @@ Every build script sources this first. It:
 * Provides `init_venv` / `activate_venv` for build-time virtualenvs.
 
 ### Windows: `scripts/pyinstaller/build_win.sh`
+
+The target architecture comes from `BUILD_ARCH` (`win32`/`win64`), which is what
+picks the VLC zip and both artifact names — how to set it, and what else a
+Windows build needs, is under *Windows: getting the toolchain* above.
 
 Notable details:
 
