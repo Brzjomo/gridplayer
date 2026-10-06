@@ -14,6 +14,7 @@ from gridplayer.models.recent_list import (
     RecentListVideos,
 )
 from gridplayer.models.resolver_patterns import ResolverPatterns
+from gridplayer.models.spectrum_colors import SpectrumColors
 from gridplayer.params import env
 from gridplayer.params.languages import get_system_language
 from gridplayer.params.static import (
@@ -84,6 +85,10 @@ _default_settings = {
     "playlist/save_state": False,
     "playlist/save_window": False,
     "playlist/seek_sync_mode": SeekSyncMode.DISABLED,
+    "playlist/spectrum_colors": SpectrumColors(),
+    # which of the sizes the alignment dialog moves a video by is being
+    # used, as a place in its list of them: see dialogs/align_videos.py
+    "playlist/sync_nudge_step": 0,
     "playlist/bookmarks_shared": True,
     "playlist/unsaved_changes": UnsavedChangesMode.ASK,
     "playlist/shuffle_on_load": False,

@@ -23,7 +23,9 @@ from collections import Counter, OrderedDict, defaultdict, deque
 from dataclasses import dataclass
 from enum import auto
 from itertools import combinations
+from operator import mul
 from pathlib import Path
+from threading import Lock
 
 from gridplayer.params.static import AutoName
 
@@ -42,13 +44,53 @@ SAMPLE_RATE = 8000
 # sounds; much less and a single loud block decides the answer.
 MIN_OVERLAP_SEC = 1.0
 
-MIN_OVERLAP_BLOCKS = round(MIN_OVERLAP_SEC * BLOCKS_PER_SEC)
+# How far apart two recordings may be and still be lined up by the close
+# pass. Long enough to be worth doing at all -- a range of a second or two is
+# a range that could have been matched by hand -- and long enough for the one
+# case the coarse pass can be right about and the viewer still be stuck in:
+# a recording with a section added to it, where the two are together on one
+# side of the addition and a section apart on the other.
+#
+# It is half of the snippet, which is as far as one reading can be moved
+# against the other and still have half of them left to compare: with
+# FINE_SNIPPET_MS at a minute, thirty seconds either way leaves thirty
+# seconds of the two still shared at the far end.
+MAX_LAG_SEC = 30.0
 
-# How far apart two recordings may be and still be lined up by this. Long
-# enough to be worth doing at all: a range of a second or two is a range
-# that could have been matched by hand, and the point of this is the
-# recordings nobody wants to match by hand.
-MAX_LAG_SEC = 12.0
+# How far apart two recordings may be and still be lined up at all, which is
+# a different question from the one above. The fine range is what a snippet
+# read either side of the moment can still share; this one is what a stretch
+# read across minutes of the recordings is looked over to find.
+#
+# Ten minutes either way is what a grid of recordings of one event is out by
+# before anything has been done about it -- a few minutes, measured on the
+# recordings this is for -- so it is the range that makes lining them up
+# automatic rather than something to be done by hand first.
+COARSE_MAX_LAG_SEC = 600.0
+
+# How much sound a reading looks at, and how much more than that is taken
+# where the recordings may be minutes apart.
+#
+# A wide reading is the whole of the coarse range either side of the moment
+# with the fine snippet on top of it, because the fine pass reads *after*
+# the coarse one has been acted on: the moment it reads around can be a
+# whole range further into the recording than the moment the wide reading
+# was taken at, and its snippet has to be inside what has already been
+# decoded. One decode answering both passes is what that buys. The margin
+# is for the rounding and for a seek that lands a moment short.
+#
+# A minute of snippet rather than thirty seconds, at a cost of thirty seconds
+# more envelope to measure and a range twice as wide to search through it:
+# what that buys is that a recording with a section added in it can be lined
+# up at either side of the addition, and not only at the side the coarse pass
+# happened to settle on. See MAX_LAG_SEC.
+FINE_SNIPPET_MS = 60000
+
+WIDE_READ_MARGIN_MS = 5000
+
+WIDE_READ_MS = (
+    round(2 * COARSE_MAX_LAG_SEC * 1000) + FINE_SNIPPET_MS + WIDE_READ_MARGIN_MS
+)
 
 # Looking that far at that fineness is a great many comparisons, and almost
 # all of them are nowhere near. Every COARSE_DECIMATION blocks are averaged
@@ -64,13 +106,14 @@ COARSE_DECIMATION = 20
 
 # How far either side of the rough answer the close look reaches. One
 # coarse block is COARSE_DECIMATION of the fine ones, so this covers the
-# worst the rough answer can be, with room to spare.
-FINE_REACH_BLOCKS = COARSE_DECIMATION * 3
+# worst the rough answer can be, with room to spare. In seconds, since how
+# long a block is is the scale's to say.
+FINE_REACH_SEC = COARSE_DECIMATION * 3 / BLOCKS_PER_SEC
 
 # How much of the sound the close look compares. Four seconds of it is more
 # than enough to place a sound, and keeping it to a stretch is what keeps
 # the close look quick enough to run while somebody waits.
-FINE_SPAN_BLOCKS = 2000
+FINE_SPAN_SEC = 4.0
 
 
 @dataclass(frozen=True)
@@ -90,17 +133,20 @@ class Lag:
     score: float
     prominence: float = 1.0
 
+    # what a block of this lag is worth on the clock, which is the scale's
+    # to say: a lag found over minutes of a recording is in second-long
+    # blocks and one found over a snippet is in two-millisecond ones
+    blocks_per_sec: int = BLOCKS_PER_SEC
+
     @property
     def offset_shift_ms(self) -> int:
-        return round(self.blocks * 1000 / BLOCKS_PER_SEC)
+        return round(self.blocks * 1000 / self.blocks_per_sec)
 
 
 # How far away another peak has to be to count as another peak and not the
 # shoulder of this one. A second either way, which is well past the width
 # of any one sound and well short of the range being searched.
 PEAK_SEPARATION_SEC = 1.0
-
-PEAK_SEPARATION_BLOCKS = round(PEAK_SEPARATION_SEC * BLOCKS_PER_SEC)
 
 # How far the best peak has to stand above the best one far from it before
 # the answer is worth acting on, as a share of the best peak's own score.
@@ -138,7 +184,161 @@ MIN_SCORE = 0.3
 # half a second leaves that, and it is what gets compared.
 SHAPE_SPAN_SEC = 0.5
 
-SHAPE_SPAN_BLOCKS = round(SHAPE_SPAN_SEC * BLOCKS_PER_SEC)
+# How far two pairs of readings may disagree about where a recording sits
+# before the disagreement is reported instead of acted on.
+#
+# A recording's sound carries a constant of its own from the encoder it
+# came through -- measured at 128 ms between PCM and AAC -- so a pair of
+# differently encoded recordings is not expected to agree to the
+# millisecond, and a tolerance below that would report the encoder as a
+# disagreement. A lag settled on the wrong peak, on the other hand, is out
+# by whole seconds. This sits well above the one and well below the other.
+CONFLICT_MS = 300
+
+
+@dataclass(frozen=True)
+class Scale:
+    """How finely a run of readings is looked at, and how far.
+
+    Everything the search does that depends on how long a block is, in one
+    place, because there is more than one size worth searching at and none
+    of them is the other's: the fine scale looks at a snippet read around
+    the moment the videos are on, and the coarse one looks at minutes of the
+    recordings, which is what finds a lag of minutes at all. `best_lag`,
+    `measure_pairs` and `align` take one of these and do not care which.
+
+    How long a block is is the scale's to say, and it is the number that
+    turns a lag into milliseconds: ten blocks of a coarse reading is ten
+    seconds and ten blocks of a fine one is twenty milliseconds.
+    """
+
+    blocks_per_sec: int
+
+    # how far a lag may be, and how much of the two readings must still be
+    # shared at that lag for it to mean anything
+    max_lag_sec: float
+    min_overlap_sec: float
+
+    # how much of the swell is taken out of an envelope before two are
+    # compared, and how far away another peak has to be to count as a rival
+    # rather than as the shoulder of the answer
+    shape_span_sec: float
+    peak_separation_sec: float
+
+    # the close look: how much of the sound it compares, and how far either
+    # side of the rough answer it reaches
+    fine_span_sec: float
+    fine_reach_sec: float
+
+    # how much of the range the rough look pools away before searching it
+    coarse_decimation: int
+
+    # how well two envelopes must agree, and how far the answer must stand
+    # above its best distant rival, before it is acted on
+    min_score: float
+    min_prominence: float
+
+    # how far two pairs may disagree about one recording
+    conflict_ms: int
+
+    @property
+    def ms_per_block(self) -> float:
+        return 1000 / self.blocks_per_sec
+
+    @property
+    def max_lag_blocks(self) -> int:
+        return round(self.max_lag_sec * self.blocks_per_sec)
+
+    @property
+    def min_overlap_blocks(self) -> int:
+        return round(self.min_overlap_sec * self.blocks_per_sec)
+
+    @property
+    def shape_span_blocks(self) -> int:
+        return round(self.shape_span_sec * self.blocks_per_sec)
+
+    @property
+    def peak_separation_blocks(self) -> int:
+        return round(self.peak_separation_sec * self.blocks_per_sec)
+
+    @property
+    def fine_span_blocks(self) -> int:
+        return round(self.fine_span_sec * self.blocks_per_sec)
+
+    @property
+    def fine_reach_blocks(self) -> int:
+        return round(self.fine_reach_sec * self.blocks_per_sec)
+
+
+# The scale the search over a snippet is made at: two milliseconds a block,
+# which is what places a lag to the millisecond. Everything above is here,
+# and the numbers behind it are the ones argued for where they are written.
+#
+# The snippet is a minute and the range is half of it: see FINE_SNIPPET_MS
+# and MAX_LAG_SEC for what that is for and what it costs.
+FINE_SCALE = Scale(
+    blocks_per_sec=BLOCKS_PER_SEC,
+    max_lag_sec=MAX_LAG_SEC,
+    min_overlap_sec=MIN_OVERLAP_SEC,
+    shape_span_sec=SHAPE_SPAN_SEC,
+    peak_separation_sec=PEAK_SEPARATION_SEC,
+    fine_span_sec=FINE_SPAN_SEC,
+    fine_reach_sec=FINE_REACH_SEC,
+    coarse_decimation=COARSE_DECIMATION,
+    min_score=MIN_SCORE,
+    min_prominence=MIN_PROMINENCE,
+    conflict_ms=CONFLICT_MS,
+)
+
+# The scale the search over minutes of a recording is made at: a block a
+# second, over ten minutes either way.
+#
+# A second a block is as coarse as this can be and still place anything. A
+# quarter of an hour of a recording is a thousand blocks of it, which is
+# enough shape to be going on, and comparing the whole range at that size
+# costs a fraction of a second in pure Python. Measured on synthetic
+# recordings of one event an hour long, shifted by a known amount: lags of
+# 5, 61, 300 and 599 seconds all came back exactly, at scores of 0.8 to 0.9,
+# where two recordings of different events reached 0.05 -- and where the
+# search settled on the wrong place instead, it did so at a score of 0.02 to
+# 0.11, so the answer is thrown away rather than acted on. A wrong answer
+# that looks like a right one is the thing this has to not do.
+#
+# The overlap wanted is a minute of shared sound, because an hour of it is
+# what is being compared and a second of it either side of a real match is
+# nothing to go on. The distance between rivals is the same idea at this
+# size: half a minute apart is two peaks at a block a second.
+#
+# `coarse_decimation` is five here, and not the fine scale's twenty. Pooling
+# twenty blocks of this size averages twenty seconds of a recording into
+# one, which flattens a stretch of short sounds -- claps, footsteps, a door
+# -- into nearly one value, and the rough pass then guides the close one
+# from a peak nowhere near the answer. Measured over 64 synthetic pairs of
+# one event an hour long, shifted by 0, ±5, ±61, ±300, ±450 and ±599
+# seconds: pooled twenty and reaching a minute either way, the rough pass
+# put the close pass on the right place 60 times and on a place it had to
+# throw away 4; pooled five, it was right 64 times and threw nothing away.
+# Nothing was acted on wrongly either way -- a wrong peak scores near
+# nothing over the whole of a long overlap, which is what makes this safe --
+# but a reading that finds nothing where there was something is worth 5 s a
+# block to be rid of, and searching the range at that size is still about a
+# tenth of a second a pair.
+COARSE_SCALE = Scale(
+    blocks_per_sec=1,
+    max_lag_sec=COARSE_MAX_LAG_SEC,
+    min_overlap_sec=60.0,
+    shape_span_sec=10.0,
+    peak_separation_sec=30.0,
+    fine_span_sec=1200.0,
+    fine_reach_sec=60.0,
+    coarse_decimation=5,
+    min_score=MIN_SCORE,
+    min_prominence=MIN_PROMINENCE,
+    # five seconds, where the fine scale allows a fifth of one: at a block a
+    # second the encoder's own constant is a block or two, and a pair that
+    # disagrees by more than a few seconds has settled on another peak
+    conflict_ms=5_000,
+)
 
 
 def _shaped(envelope, span: int) -> tuple[float, ...]:
@@ -299,6 +499,16 @@ def shared_window(first: Sound, second: Sound) -> tuple[int, int] | None:
     return start, end
 
 
+# How many samples of a block are looked at where a block is long. A coarse
+# reading covers a quarter of an hour of a recording at a block a second,
+# which is eight thousand samples a block and ten million for the reading:
+# measuring every one of them is seconds of arithmetic for a number that is
+# there to say how loud a second of a recording was. Taking every fourth
+# sample through the block estimates the same loudness to about a percent,
+# which is far finer than the shape of it is ever read at.
+MAX_BLOCK_SAMPLES = 2000
+
+
 def envelope_from_samples(
     samples, sample_rate: int = SAMPLE_RATE, blocks_per_sec: int = BLOCKS_PER_SEC
 ) -> tuple[float, ...]:
@@ -306,26 +516,28 @@ def envelope_from_samples(
 
     The square root of the mean square, which is what makes a loud moment
     stand out from a quiet one whatever the recording was levelled at.
+
+    A slice at a time, summed through `map(mul, ...)`, which is done in C
+    and comes to about twice the speed of adding the squares up one sample
+    at a time in Python -- measured on ten million samples, 0.9 s against
+    1.6. See MAX_BLOCK_SAMPLES for what happens where a block is long.
     """
 
     if sample_rate <= 0 or blocks_per_sec <= 0:
         return ()
 
-    block = max(1, round(sample_rate / blocks_per_sec))
-    count = len(samples) // block
+    every = max(1, round(sample_rate / blocks_per_sec) // MAX_BLOCK_SAMPLES)
+    block = max(1, round(sample_rate / blocks_per_sec) // every)
+
+    if every > 1:
+        samples = samples[::every]
 
     envelope = []
-    total_squares = 0
 
-    # one pass rather than a slice per block: at this fineness a snippet is
-    # hundreds of thousands of samples, and making a new list of each slice
-    # of them costs more than the arithmetic
-    for index in range(count * block):
-        total_squares += samples[index] * samples[index]
+    for at in range(0, len(samples) // block * block, block):
+        one = samples[at : at + block]
 
-        if (index + 1) % block == 0:
-            envelope.append(math.sqrt(total_squares / block))
-            total_squares = 0
+        envelope.append(math.sqrt(sum(map(mul, one, one)) / block))
 
     return tuple(envelope)
 
@@ -340,7 +552,9 @@ def envelope_from_wav(
 
     A stretch and not the whole of it: the sound is read from the start of
     a recording, which for a long one is minutes of audio written out to be
-    looked at for a few seconds in the middle.
+    looked at for a few seconds in the middle. `blocks_per_sec` is how
+    finely that stretch is to be measured, which is what a coarse reading
+    of minutes of a recording asks to have turned down.
     """
 
     try:
@@ -442,6 +656,12 @@ class SnippetCache:
     block boundary, so a file written for the seventh second of a recording
     holds a few milliseconds less than seven seconds, and matching against
     that would read the same sound again every time it was asked for.
+
+    A reading is run one to a recording at a time -- see sync_align -- so
+    what is here is reached by several of them at once. Each recording has
+    a lock of its own, held for the whole of a reading of it: readings of
+    different recordings go on at once, which is the point, and two
+    readings of one recording are kept to one decode of it.
     """
 
     def __init__(self, max_recordings: int = KEPT_RECORDINGS):
@@ -450,20 +670,45 @@ class SnippetCache:
         self._directory: Path | None = None
         self._written = 0
 
-    def envelope(self, key, origin_ms: int, snippet_ms: int, fetch) -> tuple:
+        # everything kept, and the locks one recording at a time is read
+        # under. The locks are never let go of, even where what they guard
+        # is: a lock is a few bytes, and one let go of while another
+        # reading waits on it is two readings of one recording at once
+        self._lock = Lock()
+        self._key_locks: dict[tuple, Lock] = {}
+        self._no_key_lock = Lock()
+
+    def envelope(
+        self,
+        key,
+        origin_ms: int,
+        snippet_ms: int,
+        fetch,
+        blocks_per_sec: int = BLOCKS_PER_SEC,
+    ) -> tuple:
         """The envelope of a stretch, read for the first time or not.
 
         `fetch(until_ms, destination)` is what reads a stretch off a
         recording and is only called where what is already kept cannot
         answer: it is the caller that knows how to talk to a player.
+
+        `blocks_per_sec` is how finely the stretch is to be measured, which
+        is asked for per reading and does not change what is kept: a
+        stretch read for a coarse look at minutes of a recording answers
+        just as well for a fine look at a snippet of it, and that is what
+        makes the two passes cost one decode between them.
         """
 
+        with self._lock_for(key):
+            return self._envelope(key, origin_ms, snippet_ms, fetch, blocks_per_sec)
+
+    def _envelope(
+        self, key, origin_ms: int, snippet_ms: int, fetch, blocks_per_sec: int
+    ) -> tuple:
         until_ms = origin_ms + snippet_ms
-        kept = self._kept.get(key) if key is not None else None
+        kept = self._kept_now(key)
 
         if kept is not None:
-            self._kept.move_to_end(key)
-
             if origin_ms >= kept.covered_ms:
                 # past the end of the recording, where reading it again
                 # would only find the same nothing
@@ -475,8 +720,14 @@ class SnippetCache:
                     " already: reading it from there"
                 )
 
+                # read outside the lock: another recording is being read
+                # while this one is looked at, which is the whole point of
+                # the locks being per recording
                 envelope = envelope_from_wav(
-                    kept.path, from_ms=origin_ms, span_ms=snippet_ms
+                    kept.path,
+                    blocks_per_sec=blocks_per_sec,
+                    from_ms=origin_ms,
+                    span_ms=snippet_ms,
                 )
 
                 if envelope:
@@ -506,46 +757,108 @@ class SnippetCache:
         if key is not None and covered_ms > 0:
             self._keep(key, _Kept(path, until_ms, covered_ms))
 
-        return envelope_from_wav(path, from_ms=origin_ms, span_ms=snippet_ms)
+        return envelope_from_wav(
+            path,
+            blocks_per_sec=blocks_per_sec,
+            from_ms=origin_ms,
+            span_ms=snippet_ms,
+        )
+
+    def _kept_now(self, key) -> _Kept | None:
+        """What is kept for a recording, freshly used.
+
+        Held for no longer than the look at what is here: whether it
+        answers is a question about the file, which takes no locking to ask.
+        """
+
+        if key is None:
+            return None
+
+        with self._lock:
+            kept = self._kept.get(key)
+
+            if kept is not None:
+                self._kept.move_to_end(key)
+
+            return kept
+
+    def _lock_for(self, key) -> Lock:
+        """The lock one recording is read under.
+
+        A reading of a recording that cannot be told from another -- a
+        stream, or a file that has gone -- is read under a lock of its own
+        rather than under the one everything kept is, which would hold up
+        every other reading for as long as a decode lasts.
+        """
+
+        if key is None:
+            return self._no_key_lock
+
+        with self._lock:
+            return self._key_locks.setdefault(key, Lock())
 
     def clear(self):
         """Let go of everything kept, files and all."""
 
-        for key in list(self._kept):
-            self._forget(key)
+        with self._lock:
+            for key in list(self._kept):
+                self._drop(key)
 
-        if self._directory is not None:
-            shutil.rmtree(self._directory, ignore_errors=True)
-            self._directory = None
+            if self._directory is not None:
+                shutil.rmtree(self._directory, ignore_errors=True)
+                self._directory = None
 
     def _new_path(self) -> Path:
-        if self._directory is None:
-            self._directory = Path(tempfile.mkdtemp(prefix="gridplayer-sound-"))
+        with self._lock:
+            if self._directory is None:
+                self._directory = Path(tempfile.mkdtemp(prefix="gridplayer-sound-"))
 
-            # the stretches are worth keeping for as long as the process is
-            # and no longer: they are copies of sound the recordings still
-            # hold
-            atexit.register(shutil.rmtree, self._directory, ignore_errors=True)
+                # the stretches are worth keeping for as long as the process
+                # is and no longer: they are copies of sound the recordings
+                # still hold
+                atexit.register(shutil.rmtree, self._directory, ignore_errors=True)
 
-        # a name nothing else in this run has had, so a file let go of and
-        # read again is never written over one still in use
-        self._written += 1
+            # a name nothing else in this run has had, so a file let go of
+            # and read again is never written over one still in use
+            self._written += 1
 
-        return self._directory / f"snippet-{self._written}.wav"
+            return self._directory / f"snippet-{self._written}.wav"
 
     def _keep(self, key, kept: _Kept):
-        self._forget(key)
-        self._kept[key] = kept
+        with self._lock:
+            self._drop(key)
+            self._kept[key] = kept
 
-        while len(self._kept) > self._max_recordings:
-            _, oldest = self._kept.popitem(last=False)
-            oldest.path.unlink(missing_ok=True)
+            while len(self._kept) > self._max_recordings:
+                _, oldest = self._kept.popitem(last=False)
+                self._unlink(oldest.path)
 
     def _forget(self, key):
+        with self._lock:
+            self._drop(key)
+
+    def _drop(self, key):
+        """Let go of one recording, the lock already held."""
+
         kept = self._kept.pop(key, None)
 
         if kept is not None:
-            kept.path.unlink(missing_ok=True)
+            self._unlink(kept.path)
+
+    @staticmethod
+    def _unlink(path: Path):
+        """A stretch let go of, where it can be.
+
+        Another reading may be part way through the same file -- it is let
+        go of for being the oldest rather than for being unused -- and a
+        file still open cannot be taken away on Windows. What is left of
+        one is the temporary directory, which goes when the process does.
+        """
+
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as e:
+            _log.debug(f"Could not let go of {path.name}: {e}")
 
     @staticmethod
     def _name(key) -> str:
@@ -566,6 +879,7 @@ def best_lag(
     reference,
     other,
     max_lag_blocks: int | None = None,
+    scale: Scale = FINE_SCALE,
 ) -> Lag | None:
     """How far `other` sits behind `reference`, and how sure that is.
 
@@ -577,23 +891,29 @@ def best_lag(
 
     How sure the answer is takes a third thing: what the other places in
     the range are worth. See _prominence.
+
+    `scale` says how long a block of the envelopes given is and how far
+    apart they may be, so that the same search answers for a snippet read
+    around the moment and for minutes of the recordings.
     """
 
     if not reference or not other:
         return None
 
     if max_lag_blocks is None:
-        max_lag_blocks = round(MAX_LAG_SEC * BLOCKS_PER_SEC)
+        max_lag_blocks = scale.max_lag_blocks
 
-    shaped_reference = _shaped(reference, SHAPE_SPAN_BLOCKS)
-    shaped_other = _shaped(other, SHAPE_SPAN_BLOCKS)
+    shaped_reference = _shaped(reference, scale.shape_span_blocks)
+    shaped_other = _shaped(other, scale.shape_span_blocks)
 
-    rough = _rough_lag(reference, other, max_lag_blocks)
+    rough = _rough_lag(reference, other, max_lag_blocks, scale)
 
     if rough is None:
         return None
 
-    found = _fine_lag(shaped_reference, shaped_other, rough.lag.blocks, max_lag_blocks)
+    found = _fine_lag(
+        shaped_reference, shaped_other, rough.lag.blocks, max_lag_blocks, scale
+    )
 
     answer = rough.lag.blocks if found is None else found.blocks
 
@@ -601,7 +921,7 @@ def best_lag(
     # stretch the timing was taken from. Four seconds of a quiet room says
     # nothing about whether two recordings are the same, and a lag settled
     # on such a stretch would be thrown away for the number it scored.
-    score = _overall_score(shaped_reference, shaped_other, answer)
+    score = _overall_score(shaped_reference, shaped_other, answer, scale)
 
     if score <= 0:
         # nothing could be measured over all they share, which is what the
@@ -611,14 +931,17 @@ def best_lag(
     return Lag(
         answer,
         score,
-        _prominence(score, _rival_score(shaped_reference, shaped_other, rough, answer)),
+        _prominence(
+            score, _rival_score(shaped_reference, shaped_other, rough, answer, scale)
+        ),
+        scale.blocks_per_sec,
     )
 
 
-def _overall_score(reference, other, blocks: int) -> float:
+def _overall_score(reference, other, blocks: int, scale: Scale) -> float:
     """How well two envelopes agree at a lag, over all they share."""
 
-    overlap = _overlap(reference, other, blocks, MIN_OVERLAP_BLOCKS)
+    overlap = _overlap(reference, other, blocks, scale.min_overlap_blocks)
 
     if overlap is None:
         return 0.0
@@ -636,7 +959,7 @@ def _overall_score(reference, other, blocks: int) -> float:
 RIVAL_CANDIDATES = 8
 
 
-def _rival_score(reference, other, rough, answer_blocks) -> float | None:
+def _rival_score(reference, other, rough, answer_blocks, scale: Scale) -> float | None:
     """What the best place other than the answer is worth, measured the
     same way the answer was.
 
@@ -651,7 +974,8 @@ def _rival_score(reference, other, rough, answer_blocks) -> float | None:
         (
             found
             for found in rough.scored
-            if abs(found[0] * rough.step - answer_blocks) >= PEAK_SEPARATION_BLOCKS
+            if abs(found[0] * rough.step - answer_blocks)
+            >= scale.peak_separation_blocks
         ),
         key=lambda found: -found[1],
     )
@@ -660,7 +984,7 @@ def _rival_score(reference, other, rough, answer_blocks) -> float | None:
         return None
 
     return max(
-        _overall_score(reference, other, blocks * rough.step)
+        _overall_score(reference, other, blocks * rough.step, scale)
         for blocks, _score in rivals[:RIVAL_CANDIDATES]
     )
 
@@ -694,72 +1018,93 @@ class _Rough:
     step: int
 
 
-def _rough_lag(reference, other, max_lag_blocks) -> _Rough | None:
+def _rough_lag(reference, other, max_lag_blocks, scale: Scale) -> _Rough | None:
     """Where in the range it is, to within a coarse block or so."""
 
-    if max_lag_blocks <= COARSE_DECIMATION * 4:
+    if max_lag_blocks <= scale.coarse_decimation * 4:
         # a range too short to be worth making rough: look at all of it
         scored = _scan(
-            _shaped(reference, SHAPE_SPAN_BLOCKS),
-            _shaped(other, SHAPE_SPAN_BLOCKS),
+            _shaped(reference, scale.shape_span_blocks),
+            _shaped(other, scale.shape_span_blocks),
             -max_lag_blocks,
             max_lag_blocks,
-            MIN_OVERLAP_BLOCKS,
+            scale.min_overlap_blocks,
         )
 
         step = 1
     else:
-        coarse_max = max(1, max_lag_blocks // COARSE_DECIMATION)
+        coarse_max = max(1, max_lag_blocks // scale.coarse_decimation)
 
         # shaped at the size it is now and not before: averaging away the
         # swell at one size and then pooling the result would pool what is
         # left of a signal that has already had its middle taken out, which
         # is very nearly nothing
-        coarse_span = max(2, SHAPE_SPAN_BLOCKS // COARSE_DECIMATION)
+        coarse_span = max(2, scale.shape_span_blocks // scale.coarse_decimation)
 
         scored = _scan(
-            _shaped(_decimate(reference), coarse_span),
-            _shaped(_decimate(other), coarse_span),
+            _shaped(_decimate(reference, scale.coarse_decimation), coarse_span),
+            _shaped(_decimate(other, scale.coarse_decimation), coarse_span),
             -coarse_max,
             coarse_max,
-            max(1, MIN_OVERLAP_BLOCKS // COARSE_DECIMATION),
+            max(1, scale.min_overlap_blocks // scale.coarse_decimation),
         )
 
-        step = COARSE_DECIMATION
+        step = scale.coarse_decimation
 
-    best = _best(scored)
+    best = _best(scored, scale)
 
     if best is None:
         return None
 
-    return _Rough(lag=Lag(best.blocks * step, best.score), scored=scored, step=step)
+    return _Rough(
+        lag=Lag(best.blocks * step, best.score, blocks_per_sec=scale.blocks_per_sec),
+        scored=scored,
+        step=step,
+    )
 
 
-def _fine_lag(reference, other, rough_blocks, max_lag_blocks):
-    """The same, looked at closely around where it was found roughly."""
+def _fine_lag(reference, other, rough_blocks, max_lag_blocks, scale: Scale):
+    """The same, looked at closely around where it was found roughly.
 
-    low = max(-max_lag_blocks, rough_blocks - FINE_REACH_BLOCKS)
-    high = min(max_lag_blocks, rough_blocks + FINE_REACH_BLOCKS)
+    A stretch of what the two have in common at the lag, and not the whole
+    of it: four seconds is enough to place a sound and keeps the close look
+    quick, where the whole of a snippet at every lag in reach would be a
+    great many more comparisons for the same answer.
 
-    span = min(FINE_SPAN_BLOCKS, len(reference))
-    start = max(0, (len(reference) - span) // 2)
-    window = reference[start : start + span]
+    What is compared is the middle of the overlap at that lag -- the same
+    stretch `_overall_score` measures -- rather than a window taken from one
+    reading and looked for in the other. A window has to *fit* in the other
+    at that lag, and a reading barely longer than the window has nowhere to
+    put it but where it already is: that is the wide pass's shape, whose
+    readings are minutes of a recording against a window of minutes, and
+    taking a window that cannot move leaves every negative lag unlooked at.
+    """
+
+    low = max(-max_lag_blocks, rough_blocks - scale.fine_reach_blocks)
+    high = min(max_lag_blocks, rough_blocks + scale.fine_reach_blocks)
 
     best = None
 
     for blocks in range(low, high + 1):
-        at = start + blocks
+        overlap = _overlap(reference, other, blocks, scale.min_overlap_blocks)
 
-        if at < 0 or at + span > len(other):
+        if overlap is None:
             continue
 
-        score = _correlation(window, other[at : at + span])
+        shared, also_shared = overlap
+
+        span = min(scale.fine_span_blocks, len(shared))
+        start = (len(shared) - span) // 2
+
+        score = _correlation(
+            shared[start : start + span], also_shared[start : start + span]
+        )
 
         if score is None:
             continue
 
         if best is None or score > best.score:
-            best = Lag(blocks, score)
+            best = Lag(blocks, score, blocks_per_sec=scale.blocks_per_sec)
 
     return best
 
@@ -795,7 +1140,7 @@ def _scan(reference, other, low: int, high: int, min_overlap: int):
     return scored
 
 
-def _best(scored) -> Lag | None:
+def _best(scored, scale: Scale) -> Lag | None:
     """The best of a range that has been scanned."""
 
     if not scored:
@@ -803,34 +1148,44 @@ def _best(scored) -> Lag | None:
 
     blocks, score = max(scored, key=lambda found: found[1])
 
-    return Lag(blocks, score)
+    return Lag(blocks, score, blocks_per_sec=scale.blocks_per_sec)
 
 
 def _overlap(reference, other, blocks: int, min_overlap: int):
     """The two runs of blocks that sit on top of each other at this lag.
 
-    The lag says where the reference's start lands in the other. For a
-    negative lag it lands before the other begins, and the share runs from
-    the start of the other to the end of the reference -- so it is the
-    reference's length that says how much of it there is. Taking the
-    other's length instead comes to the same number while the two readings
-    are of one length, and not when they are not: a recording that ends
-    inside its own snippet gives a reading shorter than the rest.
+    The lag says where the reference's start lands in the other, so block `i`
+    of the reference is block `blocks + i` of the other, and what the two
+    share is bounded by *both* lengths: however much of the reference there
+    is, and however much of the other is left after the lag.
+
+    What it is **not** is the reference's length less the lag. That is what
+    the share comes to when the two readings are of one length, and it was
+    written for two of one length -- a snippet against a snippet -- where the
+    two are the same number. They are not the same number at the wide scale,
+    where the recordings are of different lengths: 120 s of recording against
+    one with a minute added at the front is 119 blocks against 179, and at
+    the lag that lines them up (a minute) the reference's length less the lag
+    is 59 blocks -- one short of the minute of shared sound wanted, so every
+    lag past about `min_overlap` was left unevaluated and a recording with a
+    minute of something extra in it came back as nothing like the other at
+    all. Measured on two such files: 40 s inserted, found; 80 s inserted,
+    thrown away; with this, both.
     """
 
     if blocks >= 0:
-        a = reference[: len(reference) - blocks]
-        b = other[blocks:]
+        shared = min(len(reference), len(other) - blocks)
+        a = reference[:shared]
+        b = other[blocks : blocks + shared]
     else:
-        a = reference[-blocks:]
-        b = other[: len(reference) + blocks]
-
-    shared = min(len(a), len(b))
+        shared = min(len(other), len(reference) + blocks)
+        a = reference[-blocks : -blocks + shared]
+        b = other[:shared]
 
     if shared < min_overlap:
         return None
 
-    return a[:shared], b[:shared]
+    return a, b
 
 
 def _correlation(a, b) -> float | None:
@@ -858,18 +1213,6 @@ def _correlation(a, b) -> float | None:
         return None
 
     return covariance / math.sqrt(spread_a * spread_b)
-
-
-# How far two pairs of readings may disagree about where a recording sits
-# before the disagreement is reported instead of acted on.
-#
-# A recording's sound carries a constant of its own from the encoder it
-# came through -- measured at 128 ms between PCM and AAC -- so a pair of
-# differently encoded recordings is not expected to agree to the
-# millisecond, and a tolerance below that would report the encoder as a
-# disagreement. A lag settled on the wrong peak, on the other hand, is out
-# by whole seconds. This sits well above the one and well below the other.
-CONFLICT_MS = 300
 
 
 class Outcome(AutoName):
@@ -957,8 +1300,9 @@ class AlignResult:
 def measure_pairs(
     readings: dict,
     ids=None,
-    min_score: float = MIN_SCORE,
-    min_prominence: float = MIN_PROMINENCE,
+    min_score: float | None = None,
+    min_prominence: float | None = None,
+    scale: Scale = FINE_SCALE,
 ) -> tuple[Pair, ...]:
     """Every pair of readings, each with what it says about the other.
 
@@ -972,6 +1316,9 @@ def measure_pairs(
     choose from.
     """
 
+    min_score = scale.min_score if min_score is None else min_score
+    min_prominence = scale.min_prominence if min_prominence is None else min_prominence
+
     heard = [
         block_id
         for block_id in (ids if ids is not None else readings)
@@ -984,7 +1331,7 @@ def measure_pairs(
         reference = readings[reference_id]
         other = readings[block_id]
 
-        lag = best_lag(reference.envelope, other.envelope)
+        lag = best_lag(reference.envelope, other.envelope, scale=scale)
 
         if lag is None:
             continue
@@ -1010,8 +1357,9 @@ def align(
     readings: dict,
     offsets: dict,
     ids=None,
-    min_score: float = MIN_SCORE,
-    min_prominence: float = MIN_PROMINENCE,
+    min_score: float | None = None,
+    min_prominence: float | None = None,
+    scale: Scale = FINE_SCALE,
 ) -> AlignResult:
     """Where each recording's offset wants moving to, from all their sound.
 
@@ -1020,15 +1368,21 @@ def align(
     second ahead does not want telling again.
 
     Nothing is moved on a disagreement. Where two pairs of the same three
-    recordings disagree by more than CONFLICT_MS about where one of them
-    sits, the pairs involved in the disagreement and everything that was
-    only placed through them are left where they are, and the disagreement
-    is reported. Picking one of the two would be picking a recording to
-    believe without knowing which of them is wrong.
+    recordings disagree by more than the scale's tolerance about where one
+    of them sits, the pairs involved in the disagreement and everything
+    that was only placed through them are left where they are, and the
+    disagreement is reported. Picking one of the two would be picking a
+    recording to believe without knowing which of them is wrong.
+
+    `scale` is the size the readings were measured at, which is what turns
+    a lag in blocks into milliseconds: see Scale.
     """
 
+    min_score = scale.min_score if min_score is None else min_score
+    min_prominence = scale.min_prominence if min_prominence is None else min_prominence
+
     order = list(ids) if ids is not None else list(readings)
-    pairs = measure_pairs(readings, order, min_score, min_prominence)
+    pairs = measure_pairs(readings, order, min_score, min_prominence, scale)
     reliable = tuple(pair for pair in pairs if pair.is_reliable)
 
     reference_id = _reference_of(order, reliable)
@@ -1045,7 +1399,7 @@ def align(
         )
 
     deltas = _deltas_to(reference_id, reliable)
-    conflicts = _conflicts(deltas, reliable)
+    conflicts = _conflicts(deltas, reliable, scale.conflict_ms)
 
     suspects = frozenset(
         block_id
@@ -1160,7 +1514,7 @@ def _deltas_to(reference_id, pairs) -> dict:
     return deltas
 
 
-def _conflicts(deltas, pairs) -> tuple[Conflict, ...]:
+def _conflicts(deltas, pairs, conflict_ms: int = CONFLICT_MS) -> tuple[Conflict, ...]:
     """The pairs whose sound does not agree with the rest."""
 
     found = []
@@ -1171,7 +1525,7 @@ def _conflicts(deltas, pairs) -> tuple[Conflict, ...]:
 
         residual = pair.delta_ms - (deltas[pair.block_id] - deltas[pair.reference_id])
 
-        if abs(residual) > CONFLICT_MS:
+        if abs(residual) > conflict_ms:
             found.append(Conflict(pair.reference_id, pair.block_id, residual))
 
     return tuple(found)

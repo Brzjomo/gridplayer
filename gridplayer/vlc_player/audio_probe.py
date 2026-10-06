@@ -12,11 +12,14 @@ at the samples and both are worse:
   it, which is a good deal less.
 
 This player has no window, no interface and nothing to send its sound to.
-It is asked for a few seconds around a moment and left to get on with it.
+It is asked for a stretch of a recording -- a few seconds around a moment,
+or twenty minutes of it where the recordings may be minutes apart -- and
+left to get on with it.
 
 What it writes is kept by `SnippetCache`, so a second reading of the same
 recording -- which is what moving the videos about and lining them up again
-comes to -- reads the sound off the file rather than decoding it again.
+comes to, and what the fine pass over a stretch the coarse pass already
+read is -- reads the sound off the file rather than decoding it again.
 """
 
 import logging
@@ -25,6 +28,8 @@ from pathlib import Path
 
 from gridplayer.utils.log_config import DISABLED
 from gridplayer.utils.sync_audio import (
+    BLOCKS_PER_SEC,
+    FINE_SNIPPET_MS,
     SAMPLE_RATE,
     SnippetCache,
     file_key,
@@ -32,13 +37,6 @@ from gridplayer.utils.sync_audio import (
 from gridplayer.vlc_player.libvlc import vlc
 
 _log = logging.getLogger(__name__)
-
-# How much sound is looked at either side of the moment. Long, because
-# what can be lined up is bounded by it: two recordings can only be matched
-# as far apart as they still overlap by the least worth matching on, so a
-# short snippet means a range that could have been matched by hand. See
-# sync_audio.MAX_LAG_SEC.
-SNIPPET_MS = 30000
 
 # Decoding is faster than playing, but a stuck input must not hold the
 # interface for ever.
@@ -109,7 +107,11 @@ class AudioProbe:
         ]
 
     def envelope(
-        self, uri, center_ms: int, snippet_ms: int = SNIPPET_MS
+        self,
+        uri,
+        center_ms: int,
+        snippet_ms: int = FINE_SNIPPET_MS,
+        blocks_per_sec: int = BLOCKS_PER_SEC,
     ) -> tuple[tuple[float, ...], int]:
         """The loudness of the sound around a moment, and where it began.
 
@@ -129,7 +131,10 @@ class AudioProbe:
 
         What has been decoded once is kept, so the cost is paid the first
         time a recording is read and not on every reading of it: see
-        SnippetCache.
+        SnippetCache. `snippet_ms` is how much of it is looked at, and
+        `blocks_per_sec` how finely: a wide reading of minutes of a
+        recording asks for both, and the reading of a snippet taken out of
+        the same kept stretch afterwards costs nothing but the reading.
         """
 
         origin_ms = max(0, int(center_ms) - snippet_ms // 2)
@@ -139,6 +144,7 @@ class AudioProbe:
             origin_ms,
             snippet_ms,
             lambda until_ms, dst: self._write_snippet(uri, until_ms, dst),
+            blocks_per_sec,
         )
 
         return envelope, origin_ms

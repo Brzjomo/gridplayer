@@ -5,18 +5,24 @@ reading the numbers off a file, which needs one.
 """
 
 import array
+import math
 import random
 import wave
+from dataclasses import replace
 from itertools import pairwise
 from pathlib import Path
 
 import pytest
 
+from gridplayer.utils.sync_align import AlignMeasure, ReadingRequest
 from gridplayer.utils.sync_audio import (
     BLOCKS_PER_SEC,
+    COARSE_SCALE,
+    FINE_SNIPPET_MS,
     MIN_PROMINENCE,
     MIN_SCORE,
     SAMPLE_RATE,
+    WIDE_READ_MS,
     Lag,
     Outcome,
     Reading,
@@ -145,6 +151,25 @@ class TestTheEnvelope:
     def test_a_rate_that_makes_no_sense_gives_nothing_back(self):
         assert envelope_from_samples(_samples((1, BLOCK)), 0) == ()
 
+    def test_a_second_of_one_level_reads_as_that_level_at_a_block_a_second(self):
+        """A block a second is eight thousand samples, and not all of them
+        are looked at -- see MAX_BLOCK_SAMPLES. A level that does not move
+        comes out as the level it is either way."""
+
+        one_second = _samples((1000, SAMPLE_RATE))
+
+        assert envelope_from_samples(one_second, SAMPLE_RATE, 1) == (1000.0,)
+
+    def test_the_samples_a_coarse_block_looks_at_are_spread_through_it(self):
+        """Half a second of sound and half of silence is worth what that is,
+        and not what whichever half the reading happened to take is worth."""
+
+        mixed = _samples((0, SAMPLE_RATE // 2), (1000, SAMPLE_RATE // 2))
+
+        assert envelope_from_samples(mixed, SAMPLE_RATE, 1)[0] == pytest.approx(
+            1000 / math.sqrt(2)
+        )
+
 
 class TestTheEnvelopeOfAWav:
     def test_it_reads_a_mono_file(self, tmp_path):
@@ -208,6 +233,26 @@ class TestFindingTheLag:
         lag = best_lag(reference, _shifted(reference, later_by))
 
         assert lag.offset_shift_ms == 1500
+
+    def test_a_lag_of_twenty_seconds_is_inside_the_close_pass_range(self):
+        """A snippet either side of the moment is all the close pass has, and
+        half of one is twenty-five seconds.
+
+        What that is for is the one case where the coarse pass can be right
+        and the viewer still be stuck: a recording with a section added to it,
+        where the two are together on one side of the addition and a section
+        apart on the other. Twenty seconds of lag is outside everything the
+        close pass could reach when the snippet was thirty seconds long, and
+        the close pass is the only one that can place it to the millisecond.
+        """
+
+        sound = _pattern(20000)
+
+        lag = best_lag(sound, _shifted(sound, 20 * BLOCKS_PER_SEC))
+
+        assert lag.blocks == 20 * BLOCKS_PER_SEC
+        assert lag.offset_shift_ms == 20_000
+        assert lag.score > 0.9
 
     def test_a_quieter_recording_of_the_same_sound_still_matches(self):
         """The average is taken off first, so a recording made quieter
@@ -342,6 +387,130 @@ class TestTheLagReads:
     def test_one_block_is_what_a_block_is_worth(self):
         assert Lag(blocks=1, score=1.0).offset_shift_ms == round(1000 / BLOCKS_PER_SEC)
 
+    def test_a_coarse_block_is_a_second_and_not_two_milliseconds(self):
+        """The number of blocks is not the answer; the scale it was found at
+        is. The same lag is 600 ms of a fine reading and ten minutes of a
+        coarse one."""
+
+        coarse = Lag(blocks=600, score=1.0, blocks_per_sec=1)
+
+        assert coarse.offset_shift_ms == 600_000
+        assert Lag(blocks=600, score=1.0).offset_shift_ms == 1200
+
+
+class TestTheSearchOverMinutes:
+    """The scale the wide pass is made at: a block a second, over ten minutes
+    either way.
+
+    Minutes of misalignment is what this exists for. Two snippets read 30 s
+    either side of the moment share nothing at all when the recordings are
+    five minutes apart, so no search over them can answer; what is compared
+    here is a quarter of an hour either side of it, at a block a second,
+    which is where a misalignment of minutes lives.
+
+    The fixtures are an hour of an event, one microphone per recording with
+    a level of its own stepped when it likes -- and stepped at moments of
+    its own, since two microphones that step together agree at every lag.
+    """
+
+    LENGTH = 3600
+
+    @classmethod
+    def _event(cls, seed: int) -> tuple[float, ...]:
+        """An hour of something happening: bursts of it, loud and quiet, at
+        no regular interval."""
+
+        rolling = random.Random(seed)
+
+        return tuple(
+            (0.2 + rolling.random()) if rolling.random() < 0.25 else 0.01
+            for _ in range(cls.LENGTH)
+        )
+
+    @classmethod
+    def _microphone(cls, sound, arrives_by: int, seed: int) -> tuple[float, ...]:
+        """One recording of the event, its own level, and the sound arriving
+        `arrives_by` blocks later than in the other."""
+
+        rolling = random.Random(seed)
+
+        values = []
+        level = 1.0
+        next_step = rolling.randint(10, 60)
+
+        for index in range(cls.LENGTH):
+            if index >= next_step:
+                level = 0.4 + 2.0 * rolling.random()
+                next_step = index + rolling.randint(10, 60)
+
+            at = index - arrives_by
+            behind = sound[at] if 0 <= at < len(sound) else 0.0
+
+            values.append(behind * level)
+
+        return tuple(values)
+
+    @pytest.mark.parametrize("arrives_by", [0, 300, -450, 599])
+    def test_a_misalignment_of_minutes_is_found_where_it_is(self, arrives_by):
+        sound = self._event(7)
+
+        first = self._microphone(sound, arrives_by=0, seed=1)
+        second = self._microphone(sound, arrives_by=arrives_by, seed=101)
+
+        lag = best_lag(first, second, scale=COARSE_SCALE)
+
+        assert lag.blocks == arrives_by
+        assert lag.offset_shift_ms == arrives_by * 1000
+        assert lag.score >= COARSE_SCALE.min_score
+
+    def test_the_reading_of_the_lag_is_the_scale_it_was_looked_for_at(self):
+        """The same search over the same sound, told two different sizes of
+        block, comes to two different numbers of blocks for one answer: at a
+        second a block, ten minutes is six hundred of them."""
+
+        sound = self._event(7)
+
+        first = self._microphone(sound, arrives_by=0, seed=1)
+        second = self._microphone(sound, arrives_by=599, seed=101)
+
+        lag = best_lag(first, second, scale=COARSE_SCALE)
+
+        assert lag.blocks_per_sec == COARSE_SCALE.blocks_per_sec
+        assert lag.offset_shift_ms == 599_000
+
+    def test_two_recordings_of_different_events_are_thrown_away(self):
+        """An hour of one event and an hour of another have a shape at this
+        size, and it is not the same shape: what comes back is below what is
+        acted on, whichever place it settled on.
+
+        That is the property worth having. A wrong answer that scores like a
+        right one would move videos by minutes on no evidence at all.
+        """
+
+        first = self._microphone(self._event(7), arrives_by=0, seed=1)
+        second = self._microphone(self._event(70), arrives_by=120, seed=101)
+
+        lag = best_lag(first, second, scale=COARSE_SCALE)
+
+        assert lag.score < COARSE_SCALE.min_score
+
+    def test_a_lag_past_the_range_is_not_found(self):
+        """The range is the whole of what makes this worth doing, and what is
+        past it has to come back as nothing rather than as the nearest thing
+        inside it."""
+
+        sound = self._event(7)
+
+        first = self._microphone(sound, arrives_by=0, seed=1)
+        second = self._microphone(sound, arrives_by=599, seed=101)
+
+        # the same pair, asked to stay within a minute of no lag at all
+        narrow = replace(COARSE_SCALE, max_lag_sec=60.0)
+        found = best_lag(first, second, scale=narrow)
+
+        assert found.blocks != 599
+        assert found.score < COARSE_SCALE.min_score
+
 
 class TestHowSureTheAnswerIs:
     """A score says how well two recordings agree; it does not say whether
@@ -410,6 +579,34 @@ class TestReadingsOfDifferentLengths:
         lag = best_lag(reference, at_the_end)
 
         assert lag.blocks == -(len(reference) // 2)
+        assert lag.score > 0.9
+
+    @pytest.mark.parametrize("leads_by", [40, 60, 80, 100])
+    def test_a_second_recording_that_began_later_is_found_however_far_in(
+        self, leads_by
+    ):
+        """One recording with a minute or more of something else in front of
+        it, at the scale the wide pass reads at.
+
+        The lag says where the reference's start lands in the other, and what
+        the two share at that lag is bounded by both lengths. Working it out
+        from the reference's length *less the lag* -- which is the same number
+        while the two readings are of one length -- leaves a minute of a
+        120-second recording looking like fifty-nine seconds, one short of
+        the minute of shared sound a lag is believed on, so every lag past
+        about a minute was left unevaluated and a recording with eighty
+        seconds of something extra in front of it came back as nothing like
+        the other at all.
+        """
+
+        sound = _pattern(120)
+
+        reference = sound
+        later = _noise(leads_by, seed=5) + sound
+
+        lag = best_lag(reference, later, scale=COARSE_SCALE)
+
+        assert lag.blocks == leads_by
         assert lag.score > 0.9
 
 
@@ -566,14 +763,17 @@ class TestSeveralReadingsAtOnce:
         """`best_lag`, answered from a table of what each pair came to.
 
         The table is keyed by the two block ids, in the order they are
-        compared in, which is the order they were given in.
+        compared in, which is the order they were given in. The scale the
+        search would have been made at is taken and not looked at: what is
+        being tested here is what is done with an answer, and the answers
+        are all two-millisecond ones.
         """
 
         by_envelope = {
             reading.envelope: block_id for block_id, reading in readings.items()
         }
 
-        def find(reference, other, max_lag_blocks=None):
+        def find(reference, other, max_lag_blocks=None, scale=None):
             lag = answers.get((by_envelope[reference], by_envelope[other]))
 
             return None if lag is None else Lag(lag, score, prominence)
@@ -989,6 +1189,69 @@ def _write_irregular_bursts(path, duration_sec=40):
     _write_wav(path, samples)
 
 
+# How long the event the two cuts are taken from is. Long enough that a
+# reading of a quarter of an hour either side of a moment is all event, and
+# short enough to write out in a test.
+EVENT_SEC = 300
+
+
+def _write_a_cut_of_the_event(path, *, from_sec, duration_sec=EVENT_SEC):
+    """A recording of one long event, beginning `from_sec` seconds into it.
+
+    Two files cut from different points of one event are two recordings of
+    one event that began at different times, which is the case this feature
+    is for -- and the difference between the two cuts is exactly the
+    misalignment they are to be found out by.
+
+    The event is walked from the same place either time -- the same phrases
+    at the same moments of it, from a generator stepped over the part before
+    the cut -- so the sound of one cut is the sound of the other, later.
+
+    It is phrases of sound with silences between them, and not an even
+    drizzle of bursts: the pass over minutes matches the shape of the
+    loudness across a quarter of an hour, and a file where every second has
+    a burst in it has no shape at that size at all -- two of those agree at
+    every lag, which is a reading that has to be thrown away rather than one
+    that can be acted on. The bursts inside a phrase are what the pass over
+    snippets has to go on.
+    """
+
+    samples = array.array("h", bytes(duration_sec * SAMPLE_RATE * 2))
+
+    state = 987654321
+    at = 0.4
+
+    while at < from_sec + duration_sec - 1:
+        state = (state * 1103515245 + 12345) % 2147483648
+        phrase_sec = 2.0 + (state % 80) / 10
+
+        state = (state * 1103515245 + 12345) % 2147483648
+        quiet_sec = 3.0 + (state % 170) / 10
+
+        state = (state * 1103515245 + 12345) % 2147483648
+        level = 3000 + (state % 8) * 1200
+
+        burst_at = at
+
+        while burst_at < at + phrase_sec:
+            where = burst_at - from_sec
+
+            if where >= 0:
+                start = int(where * SAMPLE_RATE)
+
+                for offset in range(SAMPLE_RATE // 20):
+                    index = start + offset
+
+                    if index < len(samples):
+                        samples[index] = level if offset % 2 else -level
+
+            burst_at += 0.45
+
+        at += phrase_sec + quiet_sec
+
+    _write_wav(path, samples)
+
+
 @needs_vlc
 class TestTheProbeReadsASnippet:
     def _probe(self):
@@ -1151,3 +1414,319 @@ class TestTheProbeReadsASnippet:
             probe.cleanup()
 
         assert envelope == ()
+
+    def test_the_snippet_the_close_pass_reads_costs_no_second_decode(
+        self, tmp_path, mocker
+    ):
+        """The two passes over a recording cost one decode between them.
+
+        What is read first is minutes of the recording, at a block a second,
+        which is what the search over minutes looks at. The snippet the close
+        pass reads is inside that stretch -- and around a moment a whole
+        range further into the recording, because the wide pass moves the
+        video before the close one reads it. That is what WIDE_READ_MS is
+        for, and this is what says it is big enough.
+        """
+
+        path = tmp_path / "irregular.wav"
+        _write_irregular_bursts(path, duration_sec=120)
+
+        probe = self._probe()
+
+        try:
+            wide, wide_origin = probe.envelope(
+                path,
+                center_ms=20000,
+                snippet_ms=WIDE_READ_MS,
+                blocks_per_sec=COARSE_SCALE.blocks_per_sec,
+            )
+
+            decoding = mocker.spy(probe, "_write_snippet")
+
+            # where the wide pass would have left this video, had it found it
+            # a minute out
+            close, close_origin = probe.envelope(
+                path,
+                center_ms=20000 + 60_000,
+                snippet_ms=FINE_SNIPPET_MS,
+            )
+        finally:
+            probe.cleanup()
+
+        assert wide
+        assert close
+        assert decoding.call_count == 0
+
+        # a block a second for the wide one, and the whole of what the file
+        # holds of the stretch asked for
+        assert wide_origin == 0
+        assert len(wide) == pytest.approx(120, abs=1)
+
+        # and the snippet begins exactly where it was asked to, inside what
+        # was already decoded
+        assert close_origin == 80_000 - FINE_SNIPPET_MS // 2
+
+
+@needs_vlc
+class TestReadingEveryRecordingAtOnce:
+    """The run of readings the dialog asks for: one thread a recording.
+
+    What a run costs is the slowest recording in it rather than the sum of
+    them, which is what makes reading minutes of a five-hour recording
+    bearable at all -- and is why what comes back has to be all of them,
+    and has to say which one each is.
+    """
+
+    _qapp = None
+
+    @classmethod
+    def _application(cls):
+        """The application a Qt event loop needs, kept for the class.
+
+        A reading comes back as a queued signal, and a queued signal is
+        delivered by an event loop: without one, a run of readings never
+        says it is done.
+        """
+
+        from PyQt5.QtWidgets import QApplication
+
+        if cls._qapp is None:
+            cls._qapp = QApplication.instance() or QApplication([])
+
+        return cls._qapp
+
+    @classmethod
+    def _read(cls, requests, timeout_ms=180_000):
+        """Read these, and wait for the run to say it is done."""
+
+        from PyQt5.QtCore import QEventLoop, QTimer
+
+        cls._application()
+
+        measure = AlignMeasure()
+
+        readings_back = []
+        said = []
+
+        measure.measured.connect(readings_back.append)
+        measure.progress.connect(
+            lambda done, total, block_id: said.append((done, total, block_id))
+        )
+
+        loop = QEventLoop()
+        measure.measured.connect(lambda _readings: loop.quit())
+
+        assert measure.start(requests)
+
+        timer = QTimer()
+        timer.setSingleShot(True)
+        timer.timeout.connect(loop.quit)
+        timer.start(timeout_ms)
+
+        loop.exec_()
+
+        measure.cleanup()
+
+        assert readings_back, "the readings never came back"
+        assert not measure.is_running
+
+        return readings_back[0], said
+
+    def test_every_recording_comes_back_and_each_is_said_as_it_arrives(self, tmp_path):
+        first = tmp_path / "first.wav"
+        second = tmp_path / "second.wav"
+
+        for path in (first, second):
+            _write_clicks(path, duration_sec=20, clicks=(1.5, 3.0, 4.5, 6.0))
+
+        readings, said = self._read(
+            [
+                ReadingRequest("a", str(first), 6000, snippet_ms=6000),
+                ReadingRequest("b", str(second), 6000, snippet_ms=6000),
+            ]
+        )
+
+        assert set(readings) == {"a", "b"}
+        assert all(reading.envelope for reading in readings.values())
+
+        # one of two, then two of two, and named
+        assert sorted(done for done, _total, _block_id in said) == [1, 2]
+        assert all(total == 2 for _done, total, _block_id in said)
+        assert {block_id for _done, _total, block_id in said} == {"a", "b"}
+
+    def test_a_file_that_cannot_be_read_is_answered_for_rather_than_waited_on(
+        self, tmp_path
+    ):
+        """A file that reads as nothing is one of the things a run has to
+        come back about: a dialog waiting for two of three readings would
+        wait for ever."""
+
+        unreadable = tmp_path / "not-a-recording.wav"
+        unreadable.write_bytes(b"this is not a recording at all")
+
+        loud = tmp_path / "clicks.wav"
+        _write_clicks(loud, duration_sec=20, clicks=(1.5, 3.0))
+
+        readings, said = self._read(
+            [
+                ReadingRequest("unreadable", str(unreadable), 6000, snippet_ms=6000),
+                ReadingRequest("loud", str(loud), 6000, snippet_ms=6000),
+            ]
+        )
+
+        assert set(readings) == {"loud"}
+        assert sorted(done for done, _total, _block_id in said) == [1, 2]
+        assert {block_id for _done, _total, block_id in said} == {
+            "unreadable",
+            "loud",
+        }
+
+    def test_the_snippet_the_close_pass_reads_costs_no_second_decode(
+        self, tmp_path, mocker
+    ):
+        """The run reads minutes of a recording and then a snippet of it, in
+        that order, and the snippet comes out of what was already decoded.
+
+        In that order because that is what the dialog does: the wide pass is
+        acted on before the close one is asked for.
+        """
+
+        from gridplayer.vlc_player.audio_probe import AudioProbe
+
+        path = tmp_path / "irregular.wav"
+        _write_irregular_bursts(path, duration_sec=120)
+
+        decoding = mocker.spy(AudioProbe, "_write_snippet")
+
+        wide, _said = self._read(
+            [
+                ReadingRequest(
+                    "a",
+                    str(path),
+                    20000,
+                    snippet_ms=WIDE_READ_MS,
+                    blocks_per_sec=COARSE_SCALE.blocks_per_sec,
+                )
+            ]
+        )
+
+        # where the wide pass would have left this video, had it found it a
+        # minute out
+        close, _said = self._read(
+            [ReadingRequest("a", str(path), 20000 + 60_000, snippet_ms=FINE_SNIPPET_MS)]
+        )
+
+        assert decoding.call_count == 1
+
+        # the same recording, read twice at two sizes, and each reading is of
+        # the size it was asked for
+        assert len(wide["a"].envelope) == pytest.approx(120, abs=1)
+        assert len(close["a"].envelope) == pytest.approx(
+            FINE_SNIPPET_MS * BLOCKS_PER_SEC / 1000, rel=0.01
+        )
+
+
+@needs_vlc
+class TestTwoRecordingsThatBeganAMinuteApart:
+    """The whole of it, end to end, over two files: read at a block a second
+    to find the misalignment, and at two milliseconds to place it.
+
+    One camera began a minute after the other, so the same moment of what
+    they recorded is a minute *earlier* on the second one's own timeline --
+    which is the answer in offsets, and the whole of what the two passes are
+    to come to between them.
+
+    A minute apart is the case the fine pass cannot see any part of: two
+    snippets 30 s long share nothing at all when the recordings are a minute
+    out. What is read first is minutes of each of them -- off a real
+    decoder, into a real wav, through the real search -- and only then the
+    snippet, out of what the first reading already decoded.
+    """
+
+    LEAD_MS = -60_000
+    AT_MS = 100_000
+
+    @staticmethod
+    def _probe():
+        from gridplayer.vlc_player.audio_probe import AudioProbe
+
+        return AudioProbe()
+
+    @staticmethod
+    def _reading(probe, path, center_ms, snippet_ms, blocks_per_sec=BLOCKS_PER_SEC):
+        envelope, origin_ms = probe.envelope(
+            path,
+            center_ms,
+            snippet_ms=snippet_ms,
+            blocks_per_sec=blocks_per_sec,
+        )
+
+        assert envelope, f"nothing was read from {path}"
+
+        return Reading(envelope, origin_ms)
+
+    def test_the_minute_is_found_and_then_placed_to_the_millisecond(self, tmp_path):
+        first = tmp_path / "camera-1.wav"
+        second = tmp_path / "camera-2.wav"
+
+        _write_a_cut_of_the_event(first, from_sec=0)
+        _write_a_cut_of_the_event(second, from_sec=abs(self.LEAD_MS) // 1000)
+
+        probe = self._probe()
+
+        try:
+            # both videos on the same moment of the clock they believe in --
+            # a hundred seconds into their own recordings, no offsets set --
+            # which is a minute out in real terms and nothing like it on the
+            # clock the offsets describe
+            wide = {
+                "a": self._reading(
+                    probe,
+                    first,
+                    self.AT_MS,
+                    WIDE_READ_MS,
+                    COARSE_SCALE.blocks_per_sec,
+                ),
+                "b": self._reading(
+                    probe,
+                    second,
+                    self.AT_MS,
+                    WIDE_READ_MS,
+                    COARSE_SCALE.blocks_per_sec,
+                ),
+            }
+
+            offsets = {"a": 0, "b": 0}
+
+            found = align(wide, offsets, ["a", "b"], scale=COARSE_SCALE)
+
+            assert found.reference_id == "a"
+            assert [(one.block_id, one.shift_ms) for one in found.alignments] == [
+                ("b", self.LEAD_MS)
+            ]
+
+            # what the dialog does with that: the offset is applied, and the
+            # videos are taken to the moment it leaves them sharing
+            offsets["b"] += found.alignments[0].shift_ms
+            assert offsets["b"] == self.LEAD_MS
+
+            close = {
+                "a": self._reading(probe, first, self.AT_MS, FINE_SNIPPET_MS),
+                "b": self._reading(
+                    probe,
+                    second,
+                    self.AT_MS + offsets["b"],
+                    FINE_SNIPPET_MS,
+                ),
+            }
+        finally:
+            probe.cleanup()
+
+        placed = align(close, offsets, ["a", "b"])
+
+        # nothing left to move, or nothing worth moving: the reading of the
+        # snippet and the search over it together come to a millisecond or
+        # two, against a minute found from the sound of minutes of both files
+        residual = [one.shift_ms for one in placed.alignments]
+
+        assert residual in ([], [0]) or abs(residual[0]) <= 5, residual

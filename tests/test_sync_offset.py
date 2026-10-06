@@ -11,21 +11,35 @@ The modules that reach libVLC are imported inside the tests that need them,
 so what does not need VLC can still be run on a machine without it.
 """
 
+import logging
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 from PyQt5.QtCore import QEvent, QPoint, QPointF, Qt
-from PyQt5.QtGui import QMouseEvent, QWheelEvent
+from PyQt5.QtGui import QKeyEvent, QMouseEvent, QWheelEvent
 from PyQt5.QtWidgets import QApplication
 
+from gridplayer.dialogs.align_videos import MILLISECONDS
 from gridplayer.models.playlist import Playlist
+from gridplayer.models.spectrum_colors import SPECTRUM_COLORS, SpectrumColors
 from gridplayer.models.video import Video
 from gridplayer.params.actions import ACTIONS
 from gridplayer.params.menu import SECTIONS, SUBMENUS
 from gridplayer.params.static import SeekSyncMode
-from gridplayer.utils.sync_audio import BLOCKS_PER_SEC, Reading
+from gridplayer.utils.sync_align import ReadingRequest
+from gridplayer.utils.sync_audio import (
+    BLOCKS_PER_SEC,
+    COARSE_SCALE,
+    FINE_SNIPPET_MS,
+    WIDE_READ_MS,
+    Reading,
+    common_moment_ms,
+)
 from gridplayer.widgets.sync_strip import (
+    AXIS_HEIGHT,
+    OVERLAY_ALPHA,
+    PICKED_ALPHA,
     tick_label,
     tick_step_ms,
     ticks_between,
@@ -339,6 +353,123 @@ class TestCarryingPlaybackThrough:
         assert two.applied == []
 
 
+# --- dragging a video's sound along the clock ---
+
+
+class _DraggedBlock:
+    """As much of a video block as the three drag methods touch.
+
+    What the dialog says is where the drag would put the sound; what that
+    comes to on the recording is the video block's own business, and this is
+    a block with nothing of its own but where it is and what it holds.
+    """
+
+    def __init__(self, offset_ms=0, time=10000, is_paused=True):
+        from gridplayer.widgets.video_block import VideoBlock
+
+        # bound by hand: these are the video block's own methods, and this is
+        # not a video block
+        self.sync_offset_drag = MethodType(VideoBlock.sync_offset_drag, self)
+        self.sync_offset_drop = MethodType(VideoBlock.sync_offset_drop, self)
+        self.sync_offset_drag_give_up = MethodType(
+            VideoBlock.sync_offset_drag_give_up, self
+        )
+
+        self.is_video_initialized = True
+        self.is_live = False
+        self._drag_offset_ms = None
+        self.time = time
+        self.positioned = []
+        self._log = logging.getLogger("test")
+
+        self.video_params = SimpleNamespace(
+            sync_offset_ms=offset_ms or None, is_paused=is_paused
+        )
+
+    @property
+    def sync_offset_ms(self):
+        return self.video_params.sync_offset_ms or 0
+
+    @sync_offset_ms.setter
+    def sync_offset_ms(self, offset_ms):
+        self.video_params.sync_offset_ms = int(offset_ms) or None
+
+    def apply_sync_position(self, target_ms, is_paused):
+        self.positioned.append((target_ms, is_paused))
+
+        # the real one seeks, and a seek leaves the video where it was sent:
+        # that is what the next move is measured from
+        self.time = target_ms
+
+
+class TestDraggingASyncPoint:
+    """A drag of a video's sound, as the video itself sees it.
+
+    Every step of the drag moves the offset; the picture moves once, when
+    the drag is let go of; and a drag given up leaves nothing behind.
+    """
+
+    def test_every_step_of_a_drag_moves_the_offset_and_moves_no_picture(self):
+        """A seek for every pixel of a drag would be a stutter for every
+        pixel of it, so the picture waits."""
+
+        block = _DraggedBlock()
+
+        block.sync_offset_drag(500)
+        block.sync_offset_drag(1200)
+
+        assert block.sync_offset_ms == 1200
+        assert block.positioned == []
+
+    def test_letting_it_go_moves_the_picture_by_what_the_point_moved_by(self):
+        block = _DraggedBlock(offset_ms=2000, time=10000)
+
+        block.sync_offset_drag(3500)
+        block.sync_offset_drop()
+
+        # the moment on show is kept: the recording is described rightly and
+        # the picture goes where that says it should be
+        assert block.positioned == [(11500, True)]
+
+    def test_a_drag_let_go_of_where_nothing_moved_moves_nothing(self):
+        block = _DraggedBlock(offset_ms=2000)
+
+        block.sync_offset_drag(2000)
+        block.sync_offset_drop()
+
+        assert block.positioned == []
+
+    def test_a_drag_given_up_puts_the_offset_back_and_seeks_nothing(self):
+        block = _DraggedBlock(time=10000)
+
+        block.sync_offset_drag(2500)
+        block.sync_offset_drag_give_up()
+
+        assert block.sync_offset_ms == 0
+        assert block.positioned == []
+
+    def test_a_second_drag_starts_from_where_the_first_left_off(self):
+        block = _DraggedBlock(time=10000)
+
+        block.sync_offset_drag(1000)
+        block.sync_offset_drop()
+
+        block.sync_offset_drag(1500)
+        block.sync_offset_drop()
+
+        assert block.positioned == [(11000, True), (11500, True)]
+
+    def test_a_drag_of_a_video_that_is_not_loaded_does_nothing(self):
+        block = _DraggedBlock()
+        block.is_video_initialized = False
+
+        block.sync_offset_drag(1000)
+        block.sync_offset_drop()
+
+        assert block.sync_offset_ms == 0
+        assert block.positioned == []
+
+
 # --- what gets written down ---
 
 
@@ -540,6 +671,7 @@ class _DialogBlock:
         self.is_video_initialized = True
         self.is_live = False
         self.sync_out_of_range = out_of_range
+        self.dragged_from = None
         self.video_params = SimpleNamespace(
             uri_name="a recording",
             uri=Path("/tmp/recording.mp4") if uri is None else uri,
@@ -576,15 +708,63 @@ class _DialogBlock:
         self._no_args(args)
         self.called.append(("reset", None))
 
+    def sync_offset_drag(self, offset_ms, *args):
+        """The offset follows the drag; the picture does not, until it is let
+        go of: see VideoBlock.sync_offset_drag."""
+
+        self._no_args(args)
+        self.called.append(("drag_offset", offset_ms))
+
+        if self.dragged_from is None:
+            self.dragged_from = self.sync_offset_ms
+
+        self.sync_offset_ms = offset_ms
+
+    def sync_offset_drop(self, *args):
+        self._no_args(args)
+        self.called.append(("drop_offset", None))
+
+        # the real one takes the video to the moment the offset now says
+        self.time += self.sync_offset_ms - self.dragged_from
+        self.dragged_from = None
+
+    def sync_offset_drag_give_up(self, *args):
+        self._no_args(args)
+        self.called.append(("give_up_drag", None))
+
+        self.sync_offset_ms = self.dragged_from
+        self.dragged_from = None
+
     def sync_offset_set(self, offset_ms, *args):
         self._no_args(args)
         self.called.append(("set_offset", offset_ms))
+
+        # the real one moves the video on by what the offset moved by, so
+        # that it goes on showing the moment of the shared clock it was
+        # showing: see VideoBlock.sync_offset_set
+        self.time += offset_ms - self.sync_offset_ms
         self.sync_offset_ms = offset_ms
 
 
 class TestTheAlignmentDialog:
+    @pytest.fixture(autouse=True)
+    def _settings(self, mocker):
+        """The settings, in memory.
+
+        Which of the sizes a row's buttons move by is kept between dialogs,
+        and a test that moves it is not something to write into the machine
+        running it.
+        """
+
+        settings = mocker.MagicMock()
+        settings.get.return_value = 0
+
+        mocker.patch("gridplayer.dialogs.align_videos.Settings", return_value=settings)
+
+        return settings
+
     @staticmethod
-    def _dialog(*blocks, provider=None, is_offset_mode=None):
+    def _dialog(*blocks, provider=None, is_offset_mode=None, set_offset_mode=None):
         from gridplayer.dialogs.align_videos import AlignVideosDialog
 
         if provider is None:
@@ -592,7 +772,11 @@ class TestTheAlignmentDialog:
             def provider():
                 return list(blocks)
 
-        return AlignVideosDialog(provider, is_offset_mode=is_offset_mode)
+        return AlignVideosDialog(
+            provider,
+            is_offset_mode=is_offset_mode,
+            set_offset_mode=set_offset_mode,
+        )
 
     @staticmethod
     def _button(dialog, block_id, text):
@@ -666,40 +850,288 @@ class TestTheAlignmentDialog:
         dialog.close()
 
     def test_a_video_with_no_frame_rate_offers_no_move_in_frames(self):
+        """A size in frames needs a frame rate to be worth anything, and one
+        of those is the video's to say."""
+
         dialog = self._dialog(_DialogBlock("a", fps=None))
 
-        assert not self._button(dialog, "a", "+1f").isEnabled()
-        assert not self._button(dialog, "a", "-1f").isEnabled()
-        assert self._button(dialog, "a", "+1s").isEnabled()
+        dialog._step_combo.setCurrentIndex(dialog._step_combo.findText("1 frame"))
+
+        assert not self._button(dialog, "a", "-").isEnabled()
+        assert not self._button(dialog, "a", "+").isEnabled()
+
+        dialog._step_combo.setCurrentIndex(dialog._step_combo.findText("1 ms"))
+
+        assert self._button(dialog, "a", "-").isEnabled()
+        assert self._button(dialog, "a", "+").isEnabled()
 
         dialog.close()
 
     def test_a_video_with_a_frame_rate_offers_the_move_in_frames(self):
         dialog = self._dialog(_DialogBlock("a", fps=25.0))
 
-        assert self._button(dialog, "a", "+1f").isEnabled()
+        dialog._step_combo.setCurrentIndex(dialog._step_combo.findText("1 frame"))
+
+        assert self._button(dialog, "a", "+").isEnabled()
 
         dialog.close()
 
-    def test_set_point_marks_the_offset_where_that_video_is(self):
+    def test_the_sizes_offered_run_from_a_millisecond_to_ten_frames(self):
+        """Milliseconds first, since that is what is left to move once a grid
+        has been lined up by sound, and frames last, since they are the ones
+        a recording need not have a rate for."""
+
+        dialog = self._dialog(_DialogBlock("a"))
+
+        assert [
+            dialog._step_combo.itemText(index)
+            for index in range(dialog._step_combo.count())
+        ] == ["1 ms", "10 ms", "100 ms", "1 s", "10 s", "1 frame", "10 frames"]
+
+        dialog.close()
+
+    def test_the_size_being_moved_by_is_the_one_that_was_left_set(self, mocker):
+        """A dialog opened again opens on the size it was left on, rather
+        than on the smallest one every time."""
+
+        settings = mocker.MagicMock()
+        settings.get.return_value = 3
+
+        mocker.patch("gridplayer.dialogs.align_videos.Settings", return_value=settings)
+
+        dialog = self._dialog(_DialogBlock("a"))
+
+        assert dialog._step_combo.currentIndex() == 3
+        assert dialog._step() == (1_000, MILLISECONDS)
+
+        dialog._step_combo.setCurrentIndex(1)
+
+        assert settings.set.call_args == mocker.call("playlist/sync_nudge_step", 1)
+
+        dialog.close()
+
+    def test_a_size_past_the_end_of_the_list_is_taken_as_the_last_one(self, mocker):
+        """The list may have grown or shrunk since the size was written
+        down, and a settings file is not something to refuse to open."""
+
+        settings = mocker.MagicMock()
+        settings.get.return_value = 99
+
+        mocker.patch("gridplayer.dialogs.align_videos.Settings", return_value=settings)
+
+        dialog = self._dialog(_DialogBlock("a"))
+
+        assert dialog._step_combo.currentIndex() == dialog._step_combo.count() - 1
+
+        dialog.close()
+
+    def test_the_hints_are_the_steps_in_the_order_they_are_done(self):
+        """What the dialog is for is a procedure, and a procedure has an order
+        to it: read the sound, look at what came of it, move what is still out
+        by hand, and colour what colour is the only way to tell apart.
+
+        A list, numbered by the widget rather than by the words, so that
+        reordering or adding a step does not mean renumbering a translation --
+        and each control named by its own label, since a hint that says one
+        thing while the button says another is worse than no hint.
+        """
+
+        dialog = self._dialog(_DialogBlock("a"))
+
+        hints = dialog._hints.text()
+
+        assert hints.startswith("<ol>")
+        assert hints.count("<li>") == 6
+
+        order = [
+            hints.index("Press"),
+            hints.index("strip at the top"),
+            hints.index("Click"),
+            hints.index("look along"),
+            hints.index("press - or +"),
+            hints.index("Double-click"),
+        ]
+
+        assert order == sorted(order)
+
+        # the words the controls are labelled with, and not new ones
+        assert dialog._auto_button.text() in hints
+        assert dialog._read_button.text() in hints
+        assert "Working on" in hints
+        assert "Move by" in hints
+        assert dialog._fit_button.text() in hints
+
+        # and what the sound is looked for over, which is the one thing about
+        # the automatic path a viewer cannot see for themselves
+        assert "ten minutes either side" in hints
+
+        dialog.close()
+
+    def test_reading_the_sound_moves_nothing(self):
+        """The strips have nothing to draw until the sound has been read, and
+        reading it in order to look at it should not line anything up or move
+        a single offset: looking is not deciding."""
+
+        one = _DialogBlock("a", uri=Path("/tmp/a.mp4"))
+        two = _DialogBlock("b", uri=Path("/tmp/b.mp4"))
+
+        measure = _StubMeasure()
+        dialog = TestLiningUpBySound._dialog_with(one, two, measure=measure)
+
+        self._press(dialog._read_button)
+
+        # the snippet the strips draw, and not the minutes either side of it:
+        # a look at the sound is not a search over it
+        assert measure.started == [
+            [
+                ReadingRequest(
+                    block_id="a",
+                    uri=str(Path("/tmp/a.mp4")),
+                    center_ms=12345,
+                    snippet_ms=FINE_SNIPPET_MS,
+                    blocks_per_sec=BLOCKS_PER_SEC,
+                ),
+                ReadingRequest(
+                    block_id="b",
+                    uri=str(Path("/tmp/b.mp4")),
+                    center_ms=12345,
+                    snippet_ms=FINE_SNIPPET_MS,
+                    blocks_per_sec=BLOCKS_PER_SEC,
+                ),
+            ]
+        ]
+
+        assert not dialog._auto_button.isEnabled()
+        assert not dialog._read_button.isEnabled()
+
+        dialog._measured_sound(
+            {
+                "a": Reading(_sound(), 1000),
+                "b": Reading(_heard_later(_sound(), HALF_A_SECOND), 3000),
+            }
+        )
+
+        # read, kept for the strips, and nothing judged or moved
+        assert sorted(dialog._readings) == ["a", "b"]
+        assert one.called == []
+        assert two.called == []
+        assert "Nothing has been moved" in dialog._sound_note.text()
+
+        # the ruler is measured from the video being worked on, there being no
+        # recording the rest were judged against to take it from
+        assert dialog._zero_ms == dialog._sound_of("a", {"a": one}).read_around_ms
+
+        assert dialog._auto_button.isEnabled()
+        assert dialog._read_button.isEnabled()
+
+        dialog.close()
+
+    def test_the_tick_turns_sync_offset_on_and_off(self):
+        """The mode is needed by this dialog and the menu that owns it is
+        behind the dialog, so it is turned on and off from here.
+
+        The mode is the setting's, and the tick is told what it is rather than
+        the other way round: what is asserted here is that clicking it asks
+        for the mode to change, and that it shows the change once it has.
+        """
+
+        is_on = [False]
+        asked = []
+
+        def set_mode(value):
+            asked.append(value)
+            is_on[0] = value
+
+        dialog = self._dialog(
+            _DialogBlock("a"),
+            _DialogBlock("b"),
+            is_offset_mode=lambda: is_on[0],
+            set_offset_mode=set_mode,
+        )
+
+        assert not dialog._mode_check.isChecked()
+        assert "Sync Offset" in dialog._mode_note.text()
+
+        dialog._mode_check.setChecked(True)
+
+        assert asked == [True]
+        assert is_on[0] is True
+
+        # and the note goes as soon as the mode is on
+        dialog._refresh()
+
+        assert dialog._mode_check.isChecked()
+        assert dialog._mode_note.isHidden()
+
+        dialog._mode_check.setChecked(False)
+
+        assert asked == [True, False]
+        assert is_on[0] is False
+
+        dialog.close()
+
+    def test_the_tick_follows_the_mode_being_changed_elsewhere(self):
+        """The menu can turn it on while this is open, and a tick that went on
+        saying otherwise would be the dialog disagreeing with the grid."""
+
+        is_on = [False]
+
+        dialog = self._dialog(
+            _DialogBlock("a"),
+            _DialogBlock("b"),
+            is_offset_mode=lambda: is_on[0],
+            set_offset_mode=lambda _is_on: None,
+        )
+
+        assert not dialog._mode_check.isChecked()
+
+        is_on[0] = True
+        dialog._refresh()
+
+        assert dialog._mode_check.isChecked()
+        assert dialog._mode_note.isHidden()
+
+        dialog.close()
+
+    def test_a_row_writes_nothing_down_by_hand(self):
+        """Where a video is, as a sync point, is the right-click menu's
+        business: what this dialog does with a video is line it up, by sound
+        or by dragging its own sound until it sits where the others' does."""
+
+        from PyQt5.QtWidgets import QPushButton
+
         block = _DialogBlock("a")
         dialog = self._dialog(block)
 
-        self._press(self._button(dialog, "a", "Set point"))
+        moves = dialog._rows["a"]["moves"]
 
-        assert block.called == [("set_point", None)]
+        assert "Set point" not in [
+            one.text() for one in moves.findChildren(QPushButton)
+        ]
+
+        # and nothing on the row reaches the block but the moves, by the
+        # smallest size the list offers
+        for one in moves.findChildren(QPushButton):
+            self._press(one)
+
+        assert block.called == [
+            ("shift_ms", -1),
+            ("shift_ms", 1),
+            ("reset", None),
+        ]
 
         dialog.close()
 
-    def test_the_one_aligned_to_is_the_first_video_until_it_is_changed(self):
+    def test_the_one_being_worked_on_is_the_first_video_until_it_is_changed(self):
         dialog = self._dialog(_DialogBlock("a"), _DialogBlock("b"))
 
         assert dialog._align_to == "a"
 
         dialog.close()
 
-    def test_exactly_one_video_is_the_one_aligned_to(self):
-        """Two videos cannot both be what the others are measured from."""
+    def test_exactly_one_video_is_the_one_being_worked_on(self):
+        """The video a drag moves has to be one video: a drag that meant two
+        things at once would mean nothing."""
 
         dialog = self._dialog(_DialogBlock("a"), _DialogBlock("b"), _DialogBlock("c"))
 
@@ -714,60 +1146,17 @@ class TestTheAlignmentDialog:
 
         dialog.close()
 
-    def test_the_align_button_takes_the_others_to_the_chosen_video(self):
-        """One button for the whole dialog, not one per row."""
-
+    def test_the_video_being_worked_on_is_the_one_the_overview_lifts_out(self):
         one = _DialogBlock("a")
         two = _DialogBlock("b")
         dialog = self._dialog(one, two)
 
-        self._press(dialog._align_button)
-
-        assert one.called == [("align_others", None)]
-        assert two.called == []
-
-        dialog.close()
-
-    def test_the_align_button_names_the_video_it_acts_on(self):
-        """Which video the others go to is the whole of what it does, and it
-        is not always the one it was."""
-
-        one = _DialogBlock("a", title="camera-1.mp4")
-        two = _DialogBlock("b", title="camera-2.mp4")
-        dialog = self._dialog(one, two)
-
-        assert "camera-1.mp4" in dialog._align_button.text()
-
+        dialog._measured({"a": Reading(_sound(), 0), "b": Reading(_sound(), 0)})
         dialog._rows["b"]["align_to"].setChecked(True)
 
-        assert "camera-2.mp4" in dialog._align_button.text()
-        assert "camera-1.mp4" not in dialog._align_button.text()
+        assert [drawn.is_picked for drawn in dialog._overview._drawn] == [False, True]
 
         dialog.close()
-
-    def test_align_follows_the_chosen_video(self):
-        one = _DialogBlock("a")
-        two = _DialogBlock("b")
-        dialog = self._dialog(one, two)
-
-        dialog._rows["b"]["align_to"].setChecked(True)
-
-        self._press(dialog._align_button)
-
-        assert two.called == [("align_others", None)]
-        assert one.called == []
-
-        dialog.close()
-
-    def test_align_needs_a_video_to_align_and_something_to_align_it_to(self):
-        alone = self._dialog(_DialogBlock("a"))
-        pair = self._dialog(_DialogBlock("a"), _DialogBlock("b"))
-
-        assert not alone._align_button.isEnabled()
-        assert pair._align_button.isEnabled()
-
-        alone.close()
-        pair.close()
 
     @staticmethod
     def _checked(dialog) -> list:
@@ -782,37 +1171,52 @@ class TestTheAlignmentDialog:
         two = _DialogBlock("b", fps=25.0)
         dialog = self._dialog(one, two)
 
-        self._press(self._button(dialog, "a", "+1f"))
-        self._press(self._button(dialog, "b", "+1s"))
+        # one size in frames, and one in milliseconds: the size is set for the
+        # dialog, and which video a press reaches is what is being asked here
+        dialog._step_combo.setCurrentIndex(dialog._step_combo.findText("10 frames"))
 
-        assert one.called == [("shift_frames", 1)]
-        assert two.called == [("shift_ms", 1000)]
+        self._press(self._button(dialog, "a", "+"))
+
+        dialog._step_combo.setCurrentIndex(dialog._step_combo.findText("1 s"))
+
+        self._press(self._button(dialog, "b", "+"))
+
+        assert one.called == [("shift_frames", 10)]
+        assert two.called == [("shift_ms", 1_000)]
 
         dialog.close()
 
     @pytest.mark.parametrize(
-        ("label", "expected"),
+        ("size", "expected"),
         [
-            ("-10s", ("shift_ms", -10000)),
-            ("-1s", ("shift_ms", -1000)),
-            ("+1s", ("shift_ms", 1000)),
-            ("+10s", ("shift_ms", 10000)),
-            ("-10f", ("shift_frames", -10)),
-            ("-1f", ("shift_frames", -1)),
-            ("+1f", ("shift_frames", 1)),
-            ("+10f", ("shift_frames", 10)),
+            ("1 ms", ("shift_ms", 1)),
+            ("10 ms", ("shift_ms", 10)),
+            ("100 ms", ("shift_ms", 100)),
+            ("1 s", ("shift_ms", 1_000)),
+            ("10 s", ("shift_ms", 10_000)),
+            ("1 frame", ("shift_frames", 1)),
+            ("10 frames", ("shift_frames", 10)),
         ],
     )
-    def test_a_move_is_worth_what_its_label_says(self, label, expected):
-        """Every one of them, since a button doing the wrong amount is not
-        something a look at the dialog would find."""
+    def test_a_move_is_worth_the_size_it_is_set_to(self, size, expected):
+        """Every size, since one doing the wrong amount is not something a
+        look at the dialog would find."""
 
         block = _DialogBlock("a", fps=25.0)
         dialog = self._dialog(block)
 
-        self._press(self._button(dialog, "a", label))
+        dialog._step_combo.setCurrentIndex(dialog._step_combo.findText(size))
+
+        self._press(self._button(dialog, "a", "+"))
 
         assert block.called == [expected]
+
+        # and the other way, by the same amount
+        block.called.clear()
+
+        self._press(self._button(dialog, "a", "-"))
+
+        assert block.called == [(expected[0], -expected[1])]
 
         dialog.close()
 
@@ -837,26 +1241,12 @@ class TestTheAlignmentDialog:
 
         dialog.close()
 
-    def test_align_is_live_while_the_sync_mode_is_on(self):
-        dialog = self._dialog(
-            _DialogBlock("a"), _DialogBlock("b"), is_offset_mode=lambda: True
-        )
-
-        assert dialog._align_button.isEnabled()
-        assert dialog._mode_note.isHidden()
-
-        dialog.close()
-
-    def test_align_is_held_where_the_sync_mode_is_off(self):
-        """Outside the mode a seek carries nothing, so the move would come
-        to nothing and say nothing about it."""
-
+    def test_the_mode_note_says_what_is_missing_where_the_mode_is_off(self):
         dialog = self._dialog(
             _DialogBlock("a"), _DialogBlock("b"), is_offset_mode=lambda: False
         )
 
-        assert not dialog._align_button.isEnabled()
-        assert "Sync Offset mode" in dialog._mode_note.text()
+        assert "Sync Offset" in dialog._mode_note.text()
 
         dialog.close()
 
@@ -876,12 +1266,11 @@ class TestTheAlignmentDialog:
         on.close()
         off.close()
 
-    def test_the_other_moves_do_not_need_the_sync_mode(self):
+    def test_the_moves_do_not_need_the_sync_mode(self):
         dialog = self._dialog(_DialogBlock("a", fps=25.0), is_offset_mode=lambda: False)
 
-        assert self._button(dialog, "a", "Set point").isEnabled()
-        assert self._button(dialog, "a", "+1f").isEnabled()
-        assert self._button(dialog, "a", "+1s").isEnabled()
+        assert self._button(dialog, "a", "-").isEnabled()
+        assert self._button(dialog, "a", "+").isEnabled()
 
         dialog.close()
 
@@ -948,6 +1337,30 @@ class _StubMeasure:
         self.started.append(None)
 
 
+def _wide_reading(block_id, uri="a recording.mp4", center_ms=12345):
+    """The reading the pass over minutes of every recording asks for."""
+
+    return ReadingRequest(
+        block_id=block_id,
+        uri=uri,
+        center_ms=center_ms,
+        snippet_ms=WIDE_READ_MS,
+        blocks_per_sec=COARSE_SCALE.blocks_per_sec,
+    )
+
+
+def _close_reading(block_id, uri="a recording.mp4", center_ms=12345):
+    """The reading the pass that places it to the millisecond asks for."""
+
+    return ReadingRequest(
+        block_id=block_id,
+        uri=uri,
+        center_ms=center_ms,
+        snippet_ms=FINE_SNIPPET_MS,
+        blocks_per_sec=BLOCKS_PER_SEC,
+    )
+
+
 class TestLiningUpBySound:
     @staticmethod
     def _dialog_with(*blocks, measure=None):
@@ -960,7 +1373,12 @@ class TestLiningUpBySound:
 
     def test_it_reads_the_files_and_leaves_the_streams_alone(self):
         """A stream would have to be fetched again for every reading, at the
-        length of the snippet each time."""
+        length of the snippet each time.
+
+        What is read first is minutes of each file, a second a block: a grid
+        that is minutes out is not something a snippet read around the
+        moment can see anything of.
+        """
 
         one = _DialogBlock("a", uri=Path("/tmp/a.mp4"))
         two = _DialogBlock("b", uri=Path("/tmp/b.mp4"))
@@ -973,10 +1391,136 @@ class TestLiningUpBySound:
 
         assert measure.started == [
             [
-                ("a", str(Path("/tmp/a.mp4")), 12345),
-                ("b", str(Path("/tmp/b.mp4")), 12345),
+                _wide_reading("a", str(Path("/tmp/a.mp4"))),
+                _wide_reading("b", str(Path("/tmp/b.mp4"))),
             ]
         ]
+
+        dialog.close()
+
+    def test_the_minutes_are_read_first_and_the_snippet_after_them(self):
+        """The snippet is read around where the wide pass left the videos, so
+        that what is compared at two milliseconds a block is the sound that
+        already lines up rather than the sound that did not."""
+
+        from gridplayer.dialogs.align_videos import CLOSE_PASS, WIDE_PASS
+
+        one = _DialogBlock("a", uri=Path("/tmp/a.mp4"))
+        two = _DialogBlock("b", uri=Path("/tmp/b.mp4"))
+
+        measure = _StubMeasure()
+        dialog = self._dialog_with(one, two, measure=measure)
+
+        dialog._auto_align()
+
+        assert dialog._pass == WIDE_PASS
+        assert measure.started == [
+            [
+                _wide_reading("a", str(Path("/tmp/a.mp4"))),
+                _wide_reading("b", str(Path("/tmp/b.mp4"))),
+            ]
+        ]
+
+        # nothing could be read of either of them, and the close pass is
+        # read anyway: a misalignment a snippet can see is one the wide pass
+        # was never needed for
+        dialog._measured_wide({})
+
+        assert dialog._pass == CLOSE_PASS
+        assert measure.started[1] == [
+            _close_reading("a", str(Path("/tmp/a.mp4"))),
+            _close_reading("b", str(Path("/tmp/b.mp4"))),
+        ]
+
+        dialog.close()
+
+    def test_a_misalignment_of_minutes_is_taken_out_before_the_snippet_is_read(self):
+        """The wide pass is not a second opinion: what it finds is applied,
+        the videos are taken to the moment it leaves them sharing, and the
+        close pass reads around that."""
+
+        one = _DialogBlock("a", uri=Path("/tmp/a.mp4"))
+        two = _DialogBlock("b", uri=Path("/tmp/b.mp4"))
+
+        measure = _StubMeasure()
+        dialog = self._dialog_with(one, two, measure=measure)
+
+        dialog._auto_align()
+
+        # five minutes later in the second recording, at a second a block
+        dialog._measured_wide(
+            {
+                "a": Reading(_sound(3000), 0),
+                "b": Reading(_heard_later(_sound(3000), 300), 0),
+            }
+        )
+
+        assert ("set_offset", 300_000) in two.called
+        assert one.called == [("align_others", None)]
+
+        # and what the offsets now say is what the close pass measures
+        # against, or the five minutes would be taken out a second time
+        assert dialog._measured_offsets == {"a": 0, "b": 300_000}
+
+        # the second video has been moved five minutes further into its own
+        # recording, and that is where its snippet is read
+        assert measure.started[1] == [
+            _close_reading("a", str(Path("/tmp/a.mp4")), 12345),
+            _close_reading("b", str(Path("/tmp/b.mp4")), 312345),
+        ]
+
+        dialog.close()
+
+    def test_it_says_which_file_it_is_waiting_on(self):
+        """Minutes of a five-hour recording take tens of seconds to decode,
+        and a note that only ever says "reading" cannot be told from a dialog
+        that has stopped."""
+
+        one = _DialogBlock("a", title="first.mp4")
+        two = _DialogBlock("b", title="second.mp4")
+
+        dialog = self._dialog_with(one, two, measure=_StubMeasure())
+
+        dialog._auto_align()
+        dialog._on_progress(1, 2, "a")
+
+        assert "1 of 2" in dialog._sound_note.text()
+        assert "first.mp4" in dialog._sound_note.text()
+
+        dialog.close()
+
+    def test_the_note_says_where_the_wider_stretch_matched_nothing(self):
+        """From the outside that reads exactly like a sound that matched
+        nothing at all, and it is the diagnosis that says what to do next."""
+
+        one = _DialogBlock("a")
+        two = _DialogBlock("b")
+
+        dialog = self._dialog_with(one, two, measure=_StubMeasure())
+
+        dialog._auto_align()
+        dialog._measured_wide({})
+
+        dialog._measured({"a": Reading(_sound(), 0), "b": Reading(_sound(), 0)})
+
+        assert "Nothing in the minutes" in dialog._sound_note.text()
+
+        dialog.close()
+
+    def test_the_note_says_nothing_of_the_wider_stretch_where_it_matched(self):
+        one = _DialogBlock("a")
+        two = _DialogBlock("b")
+
+        dialog = self._dialog_with(one, two, measure=_StubMeasure())
+
+        dialog._auto_align()
+
+        dialog._measured_wide(
+            {"a": Reading(_sound(3000), 0), "b": Reading(_sound(3000), 0)}
+        )
+        dialog._measured({"a": Reading(_sound(), 0), "b": Reading(_sound(), 0)})
+
+        assert "Nothing in the minutes" not in dialog._sound_note.text()
 
         dialog.close()
 
@@ -1144,7 +1688,61 @@ class TestLiningUpBySound:
         dialog._measured({"a": Reading(_sound(), 0), "b": Reading((0.0,) * 6000, 0)})
 
         assert silent.called == []
-        assert "0 of 1" in dialog._sound_note.text()
+        assert "Nothing was lined up" in dialog._sound_note.text()
+
+        dialog.close()
+
+    def test_it_says_so_where_no_recording_was_agreed_with(self):
+        """Two of them read and neither like the other: there is no recording
+        to name as the one the rest were judged against, and naming none of
+        them would read as though one had been."""
+
+        one = _DialogBlock("a")
+        two = _DialogBlock("b")
+
+        dialog = self._dialog_with(one, two, measure=_StubMeasure())
+        dialog._auto_align()
+
+        dialog._measured({"a": Reading(_sound(), 0), "b": Reading(_other_sound(), 0)})
+
+        assert "Nothing was lined up" in dialog._sound_note.text()
+        assert "None" not in dialog._sound_note.text()
+
+        dialog.close()
+
+    def test_the_note_says_what_the_wide_pass_did_where_the_close_one_gave_up(self):
+        """The case a viewer is most likely to meet and least likely to
+        understand: the minutes either side are enough to line the grid up,
+        and the moment they are on is one only one of the recordings covers,
+        so the close pass has nothing to say about it.
+
+        Saying only what the close pass made of its snippet reads as though
+        nothing had happened at all -- and by then the offsets have already
+        been moved by the other pass.
+        """
+
+        one = _DialogBlock("a")
+        two = _DialogBlock("b")
+
+        dialog = self._dialog_with(one, two, measure=_StubMeasure())
+        dialog._auto_align()
+
+        dialog._measured_wide(
+            {"a": Reading(_sound(3000), 0), "b": Reading(_sound(3000), 0)}
+        )
+
+        assert dialog._wide_result.reference_id == "a"
+
+        dialog._measured({"a": Reading(_sound(), 0), "b": Reading(_other_sound(), 0)})
+
+        note = dialog._sound_note.text()
+
+        assert "Lined up to within a second over the minutes either side" in note
+        assert "Move the videos to a moment they both hold" in note
+
+        # and it is not also said that they were left where they were, which
+        # is not true of them by then
+        assert "Left where they were" not in note
 
         dialog.close()
 
@@ -1225,12 +1823,16 @@ class TestTheSoundStrips:
 
         strip = self._strip(dialog, "a")
 
-        assert strip._reference is None
-        assert strip._other is None
+        assert strip._sound is None
+        assert strip._zero_ms is None
 
         dialog.close()
 
-    def test_a_strip_is_given_the_two_sounds_and_the_offsets_on_them(self):
+    def test_a_strip_is_given_its_own_sound_and_the_offset_on_it(self):
+        """Only its own: what the other recordings are doing is the overview
+        strip's to say, and a row carrying both would be two things to read
+        at once in the room for one."""
+
         one = _DialogBlock("a", offset_ms=5000)
         two = _DialogBlock("b", offset_ms=7000)
 
@@ -1248,10 +1850,9 @@ class TestTheSoundStrips:
 
         strip = self._strip(dialog, "b")
 
-        assert strip._reference.origin_ms == 1000
-        assert strip._reference.offset_ms == 5000
-        assert strip._other.origin_ms == 3000
-        assert strip._other.offset_ms == 7000
+        assert strip._sound.origin_ms == 3000
+        assert strip._sound.offset_ms == 7000
+        assert strip._zero_ms == dialog._zero_ms
 
         dialog.close()
 
@@ -1264,16 +1865,20 @@ class TestTheSoundStrips:
         dialog._measured({"a": Reading(_sound(), 0), "b": Reading(_sound(), 0)})
 
         strip = self._strip(dialog, "b")
-        was_reference, was_other = strip._reference.start_ms, strip._other.start_ms
+        was_own = strip._sound.start_ms
 
         # the offset says which moment of its recording a common moment is,
         # so moving it on by a second moves that recording's sound a second
-        # earlier and leaves the reference's where it was
+        # earlier
         two.sync_offset_ms += 1000
         dialog._refresh()
 
-        assert strip._other.start_ms == was_other - 1000
-        assert strip._reference.start_ms == was_reference
+        assert strip._sound.start_ms == was_own - 1000
+
+        # and no other row's sound was moved by it
+        other = self._strip(dialog, "a")
+
+        assert other._sound.start_ms == dialog._sound_of("a", {"a": one}).start_ms
 
         dialog.close()
 
@@ -1375,13 +1980,19 @@ class TestTheSoundStrips:
         dialog.close()
 
     def test_a_drag_moves_the_window_along_the_clock(self):
+        """The row of a video that is not being worked on looks further along
+        when it is dragged: a strip that cannot be dragged at all is a strip
+        that cannot be looked along."""
+
         one = _DialogBlock("a")
         two = _DialogBlock("b")
 
         dialog = self._dialog_with(one, two)
         dialog._measured({"a": Reading(_sound(), 0), "b": Reading((0.0,) * 6000, 0)})
 
-        strip = self._strip(dialog, "a")
+        # the first video is the one being worked on, so this is one of the
+        # rows that only looks
+        strip = self._strip(dialog, "b")
         strip.resize(500, 58)
 
         was_center = strip._center_ms
@@ -1396,6 +2007,107 @@ class TestTheSoundStrips:
         )
 
         assert strip._center_ms == round(was_center + 100 * per_pixel)
+
+        dialog.close()
+
+    def test_dragging_the_video_being_worked_on_moves_its_own_sound(self):
+        """And nothing else: the offset follows the finger, no other row's
+        sound moves, and the window stays where it was."""
+
+        one = _DialogBlock("a")
+        two = _DialogBlock("b")
+
+        dialog = self._dialog_with(one, two)
+        dialog._measured({"a": Reading(_sound(), 0), "b": Reading(_sound(), 0)})
+
+        dialog._set_align_to("b")
+
+        strip = self._strip(dialog, "b")
+        strip.resize(500, 44)
+
+        per_pixel = strip._ms_per_pixel()
+        was_center = dialog._view_center_ms
+
+        # what the alignment did to them is not what the drag is being asked
+        # about: the drag is what is read from here on
+        one.called.clear()
+        two.called.clear()
+
+        strip.mousePressEvent(_mouse_event(QEvent.MouseButtonPress, 400, Qt.LeftButton))
+        strip.mouseMoveEvent(
+            _mouse_event(QEvent.MouseMove, 300, Qt.NoButton, Qt.LeftButton)
+        )
+        strip.mouseReleaseEvent(
+            _mouse_event(QEvent.MouseButtonRelease, 300, Qt.LeftButton)
+        )
+
+        # a hundred pixels to the left, so the sound is that much earlier on
+        # the clock, which is that much further into its own recording
+        moved = round(100 * per_pixel)
+
+        assert ("drag_offset", moved) in two.called
+        assert two.sync_offset_ms == moved
+
+        # and the picture goes where the sound was dragged to, once, when the
+        # drag is let go of rather than for every pixel of it
+        assert ("drop_offset", None) in two.called
+        assert two.time == 12345 + moved
+
+        assert one.called == []
+        assert dialog._view_center_ms == was_center
+
+        dialog.close()
+
+    def test_a_drag_given_up_puts_the_offset_back_and_moves_nothing(self):
+        one = _DialogBlock("a")
+        two = _DialogBlock("b")
+
+        dialog = self._dialog_with(one, two)
+        dialog._measured({"a": Reading(_sound(), 0), "b": Reading(_sound(), 0)})
+
+        dialog._set_align_to("b")
+
+        strip = self._strip(dialog, "b")
+        strip.resize(500, 44)
+
+        strip.mousePressEvent(_mouse_event(QEvent.MouseButtonPress, 400, Qt.LeftButton))
+        strip.mouseMoveEvent(
+            _mouse_event(QEvent.MouseMove, 300, Qt.NoButton, Qt.LeftButton)
+        )
+        strip.keyPressEvent(_key_event(Qt.Key_Escape))
+
+        assert ("give_up_drag", None) in two.called
+        assert two.sync_offset_ms == 0
+
+        # nothing was seeked anywhere, so nothing had to be seeked back
+        assert two.time == 12345
+
+        dialog.close()
+
+    def test_a_row_with_nothing_read_looks_along_instead_of_moving(self):
+        """A drag has to mean something: with no sound read there is nothing
+        to move against, and looking further along is what is left."""
+
+        one = _DialogBlock("a")
+        two = _DialogBlock("b")
+
+        dialog = self._dialog_with(one, two)
+
+        strip = self._strip(dialog, "a")
+        strip.resize(500, 44)
+
+        was_center = strip._center_ms
+
+        strip.mousePressEvent(_mouse_event(QEvent.MouseButtonPress, 400, Qt.LeftButton))
+        strip.mouseMoveEvent(
+            _mouse_event(QEvent.MouseMove, 300, Qt.NoButton, Qt.LeftButton)
+        )
+        strip.mouseReleaseEvent(
+            _mouse_event(QEvent.MouseButtonRelease, 300, Qt.LeftButton)
+        )
+
+        assert one.called == []
+        assert strip._center_ms != was_center
 
         dialog.close()
 
@@ -1507,9 +2219,10 @@ class TestTheSoundStrips:
 
         dialog.close()
 
-    def test_the_zero_of_the_ruler_is_the_reference_s_sound(self):
-        """The reference is what the others are moved against, so the middle
-        of what was read from it is what the whole dialog is measured from."""
+    def test_the_zero_of_every_strip_is_the_moment_the_sound_was_read_around(self):
+        """Zero is where the videos were when their sound was read, and it
+        stays there: the offsets are tuned under it, so a sound that has been
+        moved is seen to have moved."""
 
         one = _DialogBlock("a", offset_ms=5000)
         two = _DialogBlock("b", offset_ms=7000)
@@ -1518,17 +2231,19 @@ class TestTheSoundStrips:
 
         dialog._measured({"a": Reading(_sound(), 1000), "b": Reading(_sound(), 3000)})
 
-        strip = self._strip(dialog, "b")
+        # the reference is the earlier of the two, and zero is where it was:
+        # its own position less the offset it holds
+        assert dialog._zero_ms == common_moment_ms(one.time, one.sync_offset_ms)
 
-        assert strip.zero_ms == strip._reference.read_around_ms
+        assert self._strip(dialog, "a")._zero_ms == dialog._zero_ms
+        assert self._strip(dialog, "b")._zero_ms == dialog._zero_ms
+        assert dialog._overview._zero_ms == dialog._zero_ms
 
         # moving the other video's offset moves its sound, not the ruler
-        was_zero = strip.zero_ms
-
         two.sync_offset_ms += 1000
         dialog._refresh()
 
-        assert strip.zero_ms == was_zero
+        assert dialog._zero_ms == common_moment_ms(one.time, one.sync_offset_ms)
 
         dialog.close()
 
@@ -1550,6 +2265,314 @@ class TestTheSoundStrips:
         assert strip._now_ms == 7000
 
         dialog.close()
+
+
+class TestTheOverviewStrip:
+    """Every video's sound over every other's, at the top of the dialog.
+
+    The rows draw one sound each, so this is the only place two recordings
+    are seen against each other -- which is the whole question being asked
+    of the eye, and the reason it is drawn at all.
+    """
+
+    @staticmethod
+    def _dialog_with(*blocks):
+        return TestTheSoundStrips._dialog_with(*blocks)
+
+    def test_it_is_given_every_video_s_sound(self):
+        one = _DialogBlock("a")
+        two = _DialogBlock("b")
+
+        dialog = self._dialog_with(one, two)
+        dialog._measured(
+            {
+                "a": Reading(_sound(), 1000),
+                "b": Reading(_heard_later(_sound(), HALF_A_SECOND), 3000),
+            }
+        )
+
+        drawn = dialog._overview._drawn
+
+        assert [one.sound.origin_ms for one in drawn] == [1000, 3000]
+
+        # the offsets the sound is drawn by are the ones the videos hold now,
+        # which is what the alignment has just moved them to
+        assert [one.sound.offset_ms for one in drawn] == [
+            one.sync_offset_ms,
+            two.sync_offset_ms,
+        ]
+
+        dialog.close()
+
+    def test_a_video_whose_sound_was_never_read_is_not_drawn_at_all(self):
+        one = _DialogBlock("a")
+        two = _DialogBlock("b")
+
+        dialog = self._dialog_with(one, two)
+        dialog._measured({"a": Reading(_sound(), 0)})
+
+        assert len(dialog._overview._drawn) == 1
+
+        dialog.close()
+
+    def test_the_video_being_worked_on_is_painted_over_the_rest(self):
+        one = _DialogBlock("a")
+        two = _DialogBlock("b")
+
+        dialog = self._dialog_with(one, two)
+        dialog._measured({"a": Reading(_sound(), 0), "b": Reading(_sound(), 0)})
+
+        assert [one.is_picked for one in dialog._overview._drawn] == [True, False]
+
+        painted = []
+        dialog._overview._paint_sound = lambda painter, sound, colour: painted.append(
+            colour
+        )
+
+        dialog._overview.grab()
+
+        # last of all, and solid: painted in its turn it would be covered by
+        # whichever recording came after it
+        assert painted[-1].alpha() == PICKED_ALPHA
+        assert all(colour.alpha() == OVERLAY_ALPHA for colour in painted[:-1])
+
+        dialog.close()
+
+    def test_nothing_is_painted_until_the_sound_has_been_read(self):
+        dialog = self._dialog_with(_DialogBlock("a"), _DialogBlock("b"))
+
+        assert dialog._overview._zero_ms is None
+
+        painted = []
+        dialog._overview._paint_sound = lambda painter, sound, colour: painted.append(
+            sound
+        )
+
+        dialog._overview.grab()
+
+        assert painted == []
+
+        dialog.close()
+
+    def test_it_looks_through_the_same_window_as_every_row(self):
+        one = _DialogBlock("a")
+        two = _DialogBlock("b")
+
+        dialog = self._dialog_with(one, two)
+        dialog._measured({"a": Reading(_sound(), 0), "b": Reading(_sound(), 0)})
+
+        strip = TestTheSoundStrips._strip(dialog, "a")
+
+        dialog._overview.resize(500, 92)
+        dialog._overview.wheelEvent(_wheel_event(400, notches=2))
+
+        assert (dialog._overview._center_ms, dialog._overview._window_ms) == (
+            strip._center_ms,
+            strip._window_ms,
+        )
+
+        strip.resize(500, 44)
+        strip.mousePressEvent(_mouse_event(QEvent.MouseButtonPress, 400, Qt.LeftButton))
+        strip.mouseMoveEvent(
+            _mouse_event(QEvent.MouseMove, 200, Qt.NoButton, Qt.LeftButton)
+        )
+
+        assert dialog._overview._center_ms == strip._center_ms
+
+        dialog.close()
+
+    def test_the_ruler_is_drawn_where_the_strips_are_read_against_it(self):
+        """One band, at the top: a ruler under every row of a grid is the
+        same ruler drawn as many times as there are videos."""
+
+        dialog = self._dialog_with(_DialogBlock("a"), _DialogBlock("b"))
+        dialog._measured({"a": Reading(_sound(), 0), "b": Reading(_sound(), 0)})
+
+        # the sound of a row begins at the top of the widget, and the sound of
+        # the overview begins under the band the numbers are in
+        assert TestTheSoundStrips._strip(dialog, "a")._top_px() == 1
+        assert dialog._overview._top_px() == AXIS_HEIGHT
+
+        dialog.close()
+
+    def test_it_can_be_drawn(self):
+        """Painted for real, offscreen: an exception in it would otherwise
+        only show up as a strip that stopped repainting."""
+
+        dialog = self._dialog_with(_DialogBlock("a"), _DialogBlock("b"))
+
+        assert dialog._overview.grab().width() > 0
+
+        dialog._measured(
+            {
+                "a": Reading(_sound(), 0),
+                "b": Reading(_heard_later(_sound(), HALF_A_SECOND), 0),
+            }
+        )
+
+        assert dialog._overview.grab().width() > 0
+
+        dialog.close()
+
+
+class TestTheColoursOfTheSound:
+    """One colour a video, so that a sound seen at the top of the dialog can
+    be told from the one beside it."""
+
+    @staticmethod
+    def _colours(dialog):
+        return [row["strip"]._colour for row in dialog._rows.values()]
+
+    def test_two_videos_are_drawn_in_colours_that_tell_them_apart(self):
+        dialog = TestTheAlignmentDialog._dialog(_DialogBlock("a"), _DialogBlock("b"))
+
+        assert len(set(self._colours(dialog))) == 2
+        assert set(self._colours(dialog)) <= set(SPECTRUM_COLORS)
+
+        dialog.close()
+
+    def test_a_colour_given_to_a_file_before_is_the_one_it_is_drawn_in(self, mocker):
+        mocker.patch(
+            "gridplayer.dialogs.align_videos.spectrum_color", return_value="#123456"
+        )
+
+        dialog = TestTheAlignmentDialog._dialog(_DialogBlock("a"), _DialogBlock("b"))
+
+        assert self._colours(dialog) == ["#123456", "#123456"]
+
+        dialog.close()
+
+    def test_double_clicking_a_strip_asks_for_a_colour_and_remembers_it(self, mocker):
+        mocker.patch(
+            "gridplayer.dialogs.align_videos.color_picked_by_hand",
+            return_value="#abcdef",
+        )
+        remembered = mocker.patch(
+            "gridplayer.dialogs.align_videos.remember_spectrum_color"
+        )
+
+        one = _DialogBlock("a", uri=Path("/tmp/a.mp4"))
+        two = _DialogBlock("b", uri=Path("/tmp/b.mp4"))
+
+        dialog = TestTheAlignmentDialog._dialog(one, two)
+        strip = dialog._rows["b"]["strip"]
+
+        strip.mouseDoubleClickEvent(
+            _mouse_event(QEvent.MouseButtonDblClick, 100, Qt.LeftButton)
+        )
+
+        assert remembered.call_args == mocker.call(Path("/tmp/b.mp4"), "#abcdef")
+
+        colours = self._colours(dialog)
+
+        assert colours[1] == "#abcdef"
+        assert colours[0] != "#abcdef"
+
+        dialog.close()
+
+    def test_giving_up_the_colour_leaves_the_one_it_had(self, mocker):
+        mocker.patch(
+            "gridplayer.dialogs.align_videos.color_picked_by_hand", return_value=None
+        )
+        remembered = mocker.patch(
+            "gridplayer.dialogs.align_videos.remember_spectrum_color"
+        )
+
+        dialog = TestTheAlignmentDialog._dialog(_DialogBlock("a"), _DialogBlock("b"))
+        strip = dialog._rows["b"]["strip"]
+        was = strip._colour
+
+        strip.mouseDoubleClickEvent(
+            _mouse_event(QEvent.MouseButtonDblClick, 100, Qt.LeftButton)
+        )
+
+        assert not remembered.called
+        assert strip._colour == was
+
+        dialog.close()
+
+
+class _FakeSettings:
+    """The settings, in memory: writing a colour in a test is not something
+    to do to the machine running it."""
+
+    def __init__(self):
+        self.values = {}
+
+    def get(self, setting):
+        return self.values.get(setting, SpectrumColors())
+
+    def set(self, setting, value):
+        if not isinstance(value, SpectrumColors):
+            raise TypeError(f"not a SpectrumColors: {value!r}")
+
+        self.values[setting] = value
+
+
+class TestTheColoursKept:
+    """What a colour given by hand is remembered against: the file, and not
+    the playlist it happened to be in."""
+
+    @pytest.fixture(autouse=True)
+    def _settings(self, mocker):
+        settings = _FakeSettings()
+
+        mocker.patch("gridplayer.settings.Settings", return_value=settings)
+
+        return settings
+
+    def test_a_colour_is_kept_against_the_file_it_was_given_to(self):
+        from gridplayer.models.spectrum_colors import (
+            remember_spectrum_color,
+            spectrum_color,
+        )
+
+        remember_spectrum_color("/tmp/a.mp4", "#123456")
+
+        assert spectrum_color("/tmp/a.mp4") == "#123456"
+        assert spectrum_color("/tmp/b.mp4") is None
+
+    def test_a_second_colour_replaces_the_first(self):
+        from gridplayer.models.spectrum_colors import (
+            remember_spectrum_color,
+            spectrum_color,
+        )
+
+        remember_spectrum_color("/tmp/a.mp4", "#123456")
+        remember_spectrum_color("/tmp/a.mp4", "#abcdef")
+
+        assert spectrum_color("/tmp/a.mp4") == "#abcdef"
+
+    def test_a_colour_can_be_taken_away(self):
+        from gridplayer.models.spectrum_colors import (
+            remember_spectrum_color,
+            spectrum_color,
+        )
+
+        remember_spectrum_color("/tmp/a.mp4", "#123456")
+        remember_spectrum_color("/tmp/a.mp4", None)
+
+        assert spectrum_color("/tmp/a.mp4") is None
+
+    def test_only_so_many_are_kept_and_the_ones_in_use_are_what_survives(self, mocker):
+        from gridplayer.models import spectrum_colors as kept
+
+        mocker.patch.object(kept, "KEPT_COLORS", 2)
+
+        kept.remember_spectrum_color("/tmp/a.mp4", "#111111")
+        kept.remember_spectrum_color("/tmp/b.mp4", "#222222")
+        kept.remember_spectrum_color("/tmp/c.mp4", "#333333")
+
+        assert kept.spectrum_color("/tmp/a.mp4") is None
+        assert kept.spectrum_color("/tmp/b.mp4") == "#222222"
+        assert kept.spectrum_color("/tmp/c.mp4") == "#333333"
+
+        # and one given a colour again is the last to go rather than the first
+        kept.remember_spectrum_color("/tmp/b.mp4", "#222222")
+        kept.remember_spectrum_color("/tmp/d.mp4", "#444444")
+
+        assert kept.spectrum_color("/tmp/b.mp4") == "#222222"
+        assert kept.spectrum_color("/tmp/c.mp4") is None
 
 
 class TestTheRulerOnAStrip:
@@ -1588,7 +2611,6 @@ class TestTheRulerOnAStrip:
 
 def _wheel_event(x: int, notches: int = 1):
     """One notch of a wheel over a widget, without a real mouse."""
-
     position = QPoint(x, 20)
 
     return QWheelEvent(
@@ -1618,3 +2640,9 @@ def _mouse_event(kind, x: int, button, buttons=None):
         buttons if buttons is not None else button,
         Qt.NoModifier,
     )
+
+
+def _key_event(key):
+    """A key pressed on a widget, without a real keyboard."""
+
+    return QKeyEvent(QEvent.KeyPress, key, Qt.NoModifier)

@@ -203,6 +203,10 @@ class VideoBlocksManager(ManagerBase):
 
         self._align_dialog = None
 
+        # whichever mode was in force when the alignment dialog turned Sync
+        # Offset on, so that turning it off again can put it back
+        self._mode_before_offset = None
+
         self._ctx.video_blocks = VideoBlocks()
 
         self._live_video_blocks = 0
@@ -477,6 +481,7 @@ class VideoBlocksManager(ManagerBase):
         dialog = AlignVideosDialog(
             self._ordered_video_blocks,
             is_offset_mode=self._is_offset_mode,
+            set_offset_mode=self._set_offset_mode,
             parent=self.parent(),
         )
 
@@ -519,6 +524,28 @@ class VideoBlocksManager(ManagerBase):
 
     def _is_offset_mode(self):
         return self._ctx.seek_sync_mode == SeekSyncMode.OFFSET
+
+    def _set_offset_mode(self, is_on: bool):
+        """Turn Sync Offset mode on or off, from the alignment dialog.
+
+        The dialog is where the mode is needed and the menu that owns it is
+        behind the dialog, so a viewer who finds it off should not have to
+        close this to go and turn it on.
+
+        Turning it off puts back whichever mode was in force when the dialog
+        turned it on: the two older modes are still offered in the menu, and
+        a viewer who had one of them keeps it rather than finding the setting
+        Disabled afterwards.
+        """
+
+        if is_on:
+            self._mode_before_offset = self._ctx.seek_sync_mode
+
+            self.set_seek_sync_mode(SeekSyncMode.OFFSET)
+
+            return
+
+        self.set_seek_sync_mode(self._mode_before_offset or SeekSyncMode.DISABLED)
 
     def _ordered_video_blocks(self):
         """Every video, in the order they are laid out to be read down."""

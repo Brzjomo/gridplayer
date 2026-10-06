@@ -571,6 +571,10 @@ class VideoBlock(QWidget):
         # (is_before_the_start, how_far_past_ms); see apply_sync_position
         self._sync_out_of_range: tuple[bool, int] | None = None
 
+        # the offset a drag of this video's sound started from, for as long
+        # as one is going on; see sync_offset_drag
+        self._drag_offset_ms: int | None = None
+
         self._title = None
         self._color = None
         self._default_title = None
@@ -1305,6 +1309,63 @@ class VideoBlock(QWidget):
     @only_seekable
     def sync_offset_reset(self):
         self.sync_offset_set(0)
+
+    @only_initialized
+    @only_seekable
+    def sync_offset_drag(self, offset_ms: int):
+        """Move this video's sync point while its sound is being dragged.
+
+        The offset is set and nothing is seeked: a drag says where the sound
+        goes several times a second, and a seek for each of them would be a
+        stutter for every pixel moved. `sync_offset_drop` is what moves the
+        picture, once, when the drag is over.
+
+        The offset the drag began from is remembered here rather than by
+        whoever is dragging, since it is this video's own: it is what the
+        picture is moved by when the drag settles, and what it is put back
+        to where the drag is given up.
+        """
+
+        if self._drag_offset_ms is None:
+            self._drag_offset_ms = self.sync_offset_ms
+
+        self.sync_offset_ms = int(offset_ms)
+
+        self._log.debug(f"Sync point dragged to {self.sync_offset_ms}ms")
+
+    @only_initialized
+    @only_seekable
+    def sync_offset_drop(self):
+        """Settle a drag: the picture goes where the offset now says.
+
+        What `sync_offset_set` does with one move, done once for a drag of
+        however many: the moment on show is kept, so the picture moves by
+        exactly what the point moved by and every other video stays put.
+        """
+
+        was, self._drag_offset_ms = self._drag_offset_ms, None
+
+        if was is None or was == self.sync_offset_ms:
+            return
+
+        self.apply_sync_position(
+            self.time + (self.sync_offset_ms - was), self.video_params.is_paused
+        )
+
+    @only_initialized
+    @only_seekable
+    def sync_offset_drag_give_up(self):
+        """Put back the offset a drag started from, and move nothing.
+
+        A drag is a gesture: one that was not meant is one to be taken back
+        whole, and by the time it is given up the video has not been seeked
+        anywhere, so nothing has to be seeked to put it right.
+        """
+
+        was, self._drag_offset_ms = self._drag_offset_ms, None
+
+        if was is not None:
+            self.sync_offset_ms = was
 
     @only_initialized
     @only_seekable

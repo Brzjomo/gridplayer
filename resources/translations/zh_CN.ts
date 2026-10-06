@@ -1149,20 +1149,52 @@
       <translation>按声音对齐</translation>
     </message>
     <message>
-      <source>Take every other video to the moment the one in Align to is on now</source>
-      <translation>把其他所有视频移到“对齐到”所选视频当前所在的时刻</translation>
+      <source>Read the sound of every file around where the videos are and draw it, moving nothing</source>
+      <translation>读取每个文件在当前画面附近的声音并画出来，不移动任何东西</translation>
     </message>
     <message>
-      <source>Each strip: the reference's sound with that video's over it, and seconds running from zero, the middle of the reference's sound.</source>
-      <translation>每条包络条：基准声音上叠加该视频的声音，秒数从零开始，零点为基准声音的中点。</translation>
+      <source>Read Sound</source>
+      <translation>读取声音</translation>
     </message>
     <message>
-      <source>Pause the videos and press Align By Sound: it reads the sound of every file, works the offsets out and moves them onto the moment they share. Where its answer is not to be trusted, line them up by hand instead: choose the video to align the rest to under Align to, put it on a moment they all recorded, and press Align others to it. What is still out is moved one frame or one second at a time by the buttons beside it, until the shapes in its strip agree at zero. Set point marks where a video is by hand, for a recording the sound cannot help with.</source>
-      <translation>暂停视频并按下“按声音对齐”：它会读取每个文件的声音，算出偏移量，然后把它们移到共有的时刻上。如果它的结果不可信，就改用手动对齐：在“对齐到”下选择作为基准的视频，把它停在所有视频都录到的某一时刻，然后按下“将其他视频对齐到它”。仍然对不齐的部分，用旁边的按钮一帧或一秒地移动，直到该视频包络条里的波形在零点处重合。对于声音帮不上忙的录像，可以用“设为同步点”手动标记视频所在的位置。</translation>
+      <source>Line the videos up by their sync points: this dialog needs it on to move anything</source>
+      <translation>按同步偏移对齐各路：这个窗口要打开它才能移动任何东西</translation>
     </message>
     <message>
-      <source>Align to</source>
-      <translation>对齐到</translation>
+      <source>Press {ALIGN} to line the videos up, or {READ} to look at their sound without moving anything.</source>
+      <translation>按“{ALIGN}”自动对齐；只想看频谱就按“{READ}”（不动任何偏移）。</translation>
+    </message>
+    <message>
+      <source>The strip at the top is every video's sound over every other's, one colour each.</source>
+      <translation>最上面那条是所有视频的频谱叠在一起，一路一个颜色。</translation>
+    </message>
+    <message>
+      <source>Click {WORKING_ON} against a video and drag its own strip to move that video; no other row moves.</source>
+      <translation>点某一路的“{WORKING_ON}”，拖它自己的那条＝移动这一路；其他行不动。</translation>
+    </message>
+    <message>
+      <source>Drag any other row's strip to look along. The wheel zooms, and {FIT} shows all of it.</source>
+      <translation>拖别的行的条子＝往前后看；滚轮缩放，“{FIT}”显示全部。</translation>
+    </message>
+    <message>
+      <source>Set {MOVE_BY}, then press - or + beside a video to move it by that much.</source>
+      <translation>先在“{MOVE_BY}”选步长，再按某一路旁边的 − 或 + 移动这么多。</translation>
+    </message>
+    <message>
+      <source>Double-click a strip to choose the colour that video's sound is drawn in.</source>
+      <translation>双击某条＝选这一路频谱的颜色。</translation>
+    </message>
+    <message>
+      <source>{ALIGN} looks ten minutes either side of where the videos are now.</source>
+      <translation>“{ALIGN}”的搜索范围是各路当前位置前后各 10 分钟。</translation>
+    </message>
+    <message>
+      <source>Working on</source>
+      <translation>操作</translation>
+    </message>
+    <message>
+      <source>Move by</source>
+      <translation>移动步长</translation>
     </message>
     <message>
       <source>Video</source>
@@ -1185,32 +1217,44 @@
       <translation>声音匹配</translation>
     </message>
     <message>
-      <source>Align the other videos to this one</source>
-      <translation>将其他视频对齐到这一个</translation>
+      <source>How far one press of - or + moves a video</source>
+      <translation>按一次 − 或 + 把这一路移动多远</translation>
     </message>
     <message>
-      <source>Mark where this video is as the moment the others line up on</source>
-      <translation>把此视频当前所在的位置标记为其他视频对齐的基准时刻</translation>
+      <source>1 frame</source>
+      <translation>1 帧</translation>
+    </message>
+    <message>
+      <source>{COUNT} frames</source>
+      <translation>{COUNT} 帧</translation>
+    </message>
+    <message>
+      <source>{COUNT} ms</source>
+      <translation>{COUNT} 毫秒</translation>
+    </message>
+    <message>
+      <source>{COUNT} s</source>
+      <translation>{COUNT} 秒</translation>
+    </message>
+    <message>
+      <source>Work on this video's sound</source>
+      <translation>操作这一路的声音</translation>
     </message>
     <message>
       <source>Play this recording from its own start again</source>
       <translation>从头重新播放此录像</translation>
     </message>
     <message>
-      <source>Set point</source>
-      <translation>设为同步点</translation>
-    </message>
-    <message>
       <source>Reset</source>
       <translation>重置</translation>
     </message>
     <message>
-      <source>Move this recording by that many frames against the others</source>
-      <translation>让此录像相对其他视频移动这么多帧</translation>
+      <source>Move this recording {SIZE} later against the others</source>
+      <translation>把这一路相对其他路往后移动 {SIZE}</translation>
     </message>
     <message>
-      <source>Move this recording by that many seconds against the others</source>
-      <translation>让此录像相对其他视频移动这么多秒</translation>
+      <source>Move this recording {SIZE} earlier against the others</source>
+      <translation>把这一路相对其他路往前移动 {SIZE}</translation>
     </message>
     <message>
       <source>reference</source>
@@ -1245,14 +1289,6 @@
       <translation>{GAP} 前结束</translation>
     </message>
     <message>
-      <source>Align others to it</source>
-      <translation>将其他视频对齐到它</translation>
-    </message>
-    <message>
-      <source>Align others to {NAME}</source>
-      <translation>将其他视频对齐到 {NAME}</translation>
-    </message>
-    <message>
       <source>Showing all of it: {TOTAL} s.</source>
       <translation>已显示全部：{TOTAL} 秒。</translation>
     </message>
@@ -1261,12 +1297,28 @@
       <translation>正在显示已读取的 {TOTAL} 秒中的 {SHOWN} 秒。</translation>
     </message>
     <message>
-      <source>Lining up by sound needs two videos that are files on this machine.</source>
-      <translation>按声音对齐需要两个本机上的视频文件。</translation>
-    </message>
-    <message>
       <source>Reading the sound…</source>
       <translation>正在读取声音…</translation>
+    </message>
+    <message>
+      <source>Reading the sound needs two videos that are files on this machine.</source>
+      <translation>读取声音需要至少两路本机文件形式的视频。</translation>
+    </message>
+    <message>
+      <source>Reading the sound closely… {DONE} of {TOTAL} ({NAME})</source>
+      <translation>正在细读声音… {DONE}/{TOTAL}（{NAME}）</translation>
+    </message>
+    <message>
+      <source>Reading the sound… {DONE} of {TOTAL} ({NAME})</source>
+      <translation>正在读取声音… {DONE}/{TOTAL}（{NAME}）</translation>
+    </message>
+    <message>
+      <source>Reading the sound closely…</source>
+      <translation>正在细读声音…</translation>
+    </message>
+    <message>
+      <source>Read the sound of {READ} of {ASKED} files. Nothing has been moved.</source>
+      <translation>已读取 {ASKED} 个文件中的 {READ} 个的声音。没有移动任何东西。</translation>
     </message>
     <message>
       <source>Nothing could be read from the sound of enough files to line anything up.</source>
@@ -1275,6 +1327,22 @@
     <message>
       <source>Lined up {ALIGNED} of {OTHERS} by sound, judged against {NAME}.</source>
       <translation>已按声音对齐 {OTHERS} 个中的 {ALIGNED} 个，以 {NAME} 为基准判定。</translation>
+    </message>
+    <message>
+      <source>Lined up to within a second over the minutes either side, judged against {NAME}, but nothing like that was heard around the moment the videos are on now.</source>
+      <translation>前后几分钟的范围里已经对齐到一秒以内（基准是 {NAME}），但当前这个位置附近没有听到相似的声音。</translation>
+    </message>
+    <message>
+      <source>Move the videos to a moment they both hold and press Align By Sound again.</source>
+      <translation>把视频挪到两路都有内容的位置，再按一次“按声音对齐”。</translation>
+    </message>
+    <message>
+      <source>Nothing was lined up: no recording was found that the others agreed with.</source>
+      <translation>没有对齐任何一路：找不到被其他路共同认可的那一路。</translation>
+    </message>
+    <message>
+      <source>Nothing in the minutes either side of it matched, so only a few seconds either way was looked over.</source>
+      <translation>前后几分钟里没有找到匹配，所以只搜索了前后几秒的范围。</translation>
     </message>
     <message>
       <source>Left where they were: {NAMED}.</source>
@@ -1301,16 +1369,20 @@
       <translation>无法与其余声音建立关联</translation>
     </message>
     <message>
-      <source>Align needs Sync Offset mode, which is off. Turn it on under Seek Sync in the right-click menu.</source>
-      <translation>对齐需要“同步偏移”模式，该模式当前已关闭。请在右键菜单的“同步模式”下开启。</translation>
-    </message>
-    <message>
-      <source>The reference's sound with this video's over it, against the clock the videos share. Wheel to zoom, drag to move along, double-click to fit.</source>
-      <translation>基准声音上叠加此视频的声音，对照各视频共用的时间轴。滚轮缩放，拖动平移，双击适合。</translation>
+      <source>Aligning needs Sync Offset, which is off. Nothing can be moved until it is on.</source>
+      <translation>对齐需要打开“同步偏移”，现在它是关的；打开之前什么都动不了。</translation>
     </message>
     <message>
       <source>No sound read yet</source>
       <translation>尚未读取声音</translation>
+    </message>
+    <message>
+      <source>This video's sound, against the clock the videos share. Wheel to zoom, double-click to choose its colour, and drag the row of the video being worked on to move its sound.</source>
+      <translation>这一路自己的声音，画在所有视频共用的时钟上。滚轮缩放，双击选颜色；拖动被操作那一路的条子可以移动它的声音。</translation>
+    </message>
+    <message>
+      <source>The sound of every video over every other's, each in its own colour, against the clock they share. Wheel to zoom, drag to move along.</source>
+      <translation>所有视频的声音叠在一起，各用自己的颜色，画在共用的时钟上。滚轮缩放，拖动可沿时间轴移动。</translation>
     </message>
   </context>
   <context>
@@ -2526,6 +2598,10 @@ Reassign it here and remove it from that action?</source>
   <context>
     <name>Seek Sync</name>
     <message>
+      <source>Sync Offset</source>
+      <translation>同步偏移</translation>
+    </message>
+    <message>
       <source>Disabled</source>
       <translation>禁用</translation>
     </message>
@@ -2536,10 +2612,6 @@ Reassign it here and remove it from that action?</source>
     <message>
       <source>Sync By Timecode</source>
       <translation>按时间码同步</translation>
-    </message>
-    <message>
-      <source>Sync Offset</source>
-      <translation>同步偏移</translation>
     </message>
     <message>
       <source>Percent</source>

@@ -10,18 +10,30 @@ the others agree with, sets the offsets from that and moves the videos onto it.
 It is the only way to do it that does not need a person to recognise anything,
 and it reports what it made of each video.
 
-**By hand, when it cannot be trusted.** Pick the video the others are to be
-lined up against -- *Align to* -- put it on a moment all of them recorded, and
-press *Align others to it*. A video that is still out is moved by the buttons
-beside it, one frame or one second at a time, until the two runs of sound agree
-at the zero of the strip under its row. A video whose sound is no use at all
-can simply be put where it belongs by hand and marked with *Set point*.
+It reads them twice, and the first reading is the wide one: minutes of every
+recording, compared a second at a time, which is what finds a grid that is
+minutes out before anything has been done about it. What that comes to is
+acted on, and only then is a snippet of each recording read -- around the
+moment the wide pass has left them all on -- and compared at two
+milliseconds a block. The snippet is read out of the sound the wide pass
+already decoded, so the second pass costs a reading and no decoding at all:
+see `sync_audio.WIDE_READ_MS`.
 
-The strips are what makes the hand path work: one ruler shared by every row, a
-line down each of them at the moment the videos are on, and the reference's
-sound drawn under that row's. They are also what makes the automatic path
-checkable, which is the point of them -- a score can be wrong, a shape that
-does not match the shape beside it is not.
+**By hand, when it cannot be trusted.** Click *Working on* against the video to
+be moved and drag its own strip: the sound follows the finger, that recording's
+picture goes where the sound was dragged to, and no other row moves at all. Every
+other row's strip drags the window along instead, which is what looking further
+along is. A video that is still out by a hair is moved by the buttons beside it,
+one frame or one second at a time, until its sound sits where the others' does at
+the zero of the strip. Double-clicking a strip is what gives that video's sound
+its colour.
+
+The strips are what makes the hand path work: one window shared by every row, a
+line at the moment the videos were read around, each row's own sound under it,
+and one strip above them all with every sound drawn over every other. They are
+also what makes the automatic path checkable, which is the point of them -- a
+score can be wrong, a shape that does not sit where the shape beside it sits is
+not.
 
 It is deliberately not modal: the videos are moved by hand while it is open,
 and a dialog that had to be dismissed before the seek bar could be reached
@@ -33,6 +45,8 @@ from pathlib import Path
 from PyQt5.QtCore import QSignalBlocker, Qt, QTimer
 from PyQt5.QtWidgets import (
     QButtonGroup,
+    QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QGridLayout,
@@ -44,9 +58,19 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from gridplayer.models.spectrum_colors import (
+    SPECTRUM_COLORS,
+    remember_spectrum_color,
+    spectrum_color,
+)
+from gridplayer.settings import Settings
 from gridplayer.utils.qt import translate
-from gridplayer.utils.sync_align import AlignMeasure
+from gridplayer.utils.sync_align import AlignMeasure, ReadingRequest
 from gridplayer.utils.sync_audio import (
+    BLOCKS_PER_SEC,
+    COARSE_SCALE,
+    FINE_SNIPPET_MS,
+    WIDE_READ_MS,
     Outcome,
     Sound,
     Verdict,
@@ -55,11 +79,14 @@ from gridplayer.utils.sync_audio import (
     shared_window,
 )
 from gridplayer.utils.time_txt import ms_time_txt
+from gridplayer.widgets.bookmark_colors import color_picked_by_hand
 from gridplayer.widgets.sync_strip import (
     DEFAULT_WINDOW_MS,
     MAX_WINDOW_MS,
     MIN_WINDOW_MS,
-    SyncEnvelopeStrip,
+    DrawnSound,
+    SyncOverviewStrip,
+    SyncSoundStrip,
 )
 from gridplayer.widgets.video_block import sync_gap_txt
 
@@ -68,13 +95,29 @@ from gridplayer.widgets.video_block import sync_gap_txt
 # position at all.
 REFRESH_MS = 200
 
+# Which of the three kinds of run a set of readings is for. The wide one
+# reads minutes of every recording and finds a misalignment of minutes; the
+# close one, read after it has been acted on, places what is left to the
+# millisecond; and the sound one is the close read on its own, drawn and not
+# acted on at all. See sync_audio.COARSE_SCALE.
+WIDE_PASS = "wide"
+CLOSE_PASS = "close"
+SOUND_PASS = "sound"
+
+# The rows of the grid, above the one-video-to-a-row part of it: what every
+# video's sound is doing against every other's, and then the headings for the
+# columns the videos below are laid out in.
+OVERVIEW_ROW = 0
+HEADER_ROW = 1
+FIRST_VIDEO_ROW = HEADER_ROW + 1
+
 # The title column, wide enough for a filename and no wider: the offsets
 # beside it are what the dialog is for.
 TITLE_WIDTH = 210
 
-# Wide enough for a radio and no wider: it is a tick, and the header above it
-# says what it means.
-ALIGN_TO_WIDTH = 60
+# Wide enough for the heading over it and no wider: it is a tick, and the
+# heading says what it means.
+ALIGN_TO_WIDTH = 78
 
 # Wide enough for the longest of what goes in them without eliding: the
 # offset's own format is bounded, a gap is not.
@@ -108,32 +151,45 @@ COLUMNS = (
 # down, since a column added above must not land on top of them.
 MOVES_COLUMN = len(COLUMNS)
 
-# Coarse and fine moves, each set in the order the numbers run: the two sides
-# of a shift belong beside each other, and the one that moves a lot beside the
-# one that moves a little.
-SECONDS_NUDGES = (
-    ("-10s", -10_000),
-    ("-1s", -1_000),
-    ("+1s", 1_000),
-    ("+10s", 10_000),
+# What one press of a row's move buttons is worth, in the order the list
+# offers them.
+#
+# The small sizes first, because what is left to move once a grid has been
+# lined up by sound is milliseconds and a frame is a long way at that point.
+# The sizes in frames last, because they are the ones a recording need not
+# have a frame rate for: see sync_offset_shift_frames.
+MILLISECONDS = "ms"
+FRAMES = "frames"
+
+NUDGE_STEPS = (
+    (1, MILLISECONDS),
+    (10, MILLISECONDS),
+    (100, MILLISECONDS),
+    (1_000, MILLISECONDS),
+    (10_000, MILLISECONDS),
+    (1, FRAMES),
+    (10, FRAMES),
 )
 
-FRAME_NUDGES = (("-10f", -10), ("-1f", -1), ("+1f", 1), ("+10f", 10))
+# The setting the size being used is kept in, so that a dialog opened again
+# opens on the size it was left on rather than on the smallest one.
+NUDGE_STEP_SETTING = "playlist/sync_nudge_step"
 
-# Between the seconds and the frames, so the two sets read apart.
-NUDGE_GROUP_GAP = 10
-
-NUDGE_BUTTON_WIDTH = 46
+NUDGE_BUTTON_WIDTH = 34
 ACTION_BUTTON_WIDTH = 84
-ALIGN_BUTTON_WIDTH = 280
+
+# Between the buttons that read the sound and the tick that says which mode
+# the sound is read for, so that the two read apart.
+ACTION_GROUP_GAP = 10
 
 # How close to the whole of what was read the window has to be before it is
 # called the whole of it: a fit lands a rounding away from the span.
 VIEW_SLACK_MS = 50
 
-# Marks the rows that move a frame rather than a second, so what they need to
-# be live can be asked of them without reading their labels back.
-IS_FRAMES = "is_frames"
+# Marks the two buttons a row is moved with, so that what they need to be
+# live can be asked of them without reading their labels back: the Reset
+# beside them is not moved by the step and is not held back by it.
+IS_NUDGE = "is_nudge"
 
 
 class AlignVideosDialog(QDialog):
@@ -142,13 +198,25 @@ class AlignVideosDialog(QDialog):
     `blocks_provider` is asked for the videos each time rather than handed
     them once: cells are added and closed while this is open, and a list taken
     when it opened would go on naming ones that are gone.
+
+    `is_offset_mode` says whether Sync Offset mode is on, and `set_offset_mode`
+    turns it on or off -- the mode is what the dialog is for, and the menu
+    that owns it is behind the dialog: a viewer who finds it off should not
+    have to close this to go and turn it on.
     """
 
-    def __init__(self, blocks_provider, is_offset_mode=None, parent=None):
+    def __init__(
+        self,
+        blocks_provider,
+        is_offset_mode=None,
+        set_offset_mode=None,
+        parent=None,
+    ):
         super().__init__(parent)
 
         self._blocks_provider = blocks_provider
         self._is_offset_mode = is_offset_mode
+        self._set_offset_mode = set_offset_mode
 
         self.setWindowTitle(translate("Dialog - Align Videos", "Align Videos"))
         self.setModal(False)
@@ -170,10 +238,10 @@ class AlignVideosDialog(QDialog):
         self._sound_note = QLabel()
         self._sound_note.setWordWrap(True)
 
-        # Which video the others are to be aligned to, and which one the last
-        # reading of the sound judged them against. They are the same thing
-        # until somebody says otherwise, and then both are worth showing: the
-        # scores are a record of the run, this is what the buttons use.
+        # Which video is being worked on, and which one the last reading of
+        # the sound judged the rest against. They are the same thing until
+        # somebody says otherwise, and then both are worth showing: the
+        # scores are a record of the run, the first is what a drag moves.
         self._align_to = None
         self._run_reference_id = None
         self._align_group = QButtonGroup(self)
@@ -185,23 +253,32 @@ class AlignVideosDialog(QDialog):
         self._readings: dict = {}
         self._sounds: dict[str, tuple[Sound, int]] = {}
 
-        # One window on the shared clock for every strip in the dialog. This
-        # is the only place it lives: see SyncEnvelopeStrip.
+        # What colour each video's sound is drawn in, worked out once a video
+        # and kept: a colour named by hand comes out of the settings, and one
+        # that was never named is taken from the palette and taken away from
+        # it, so that two videos in one dialog are not drawn alike.
+        self._colors: dict[str, str] = {}
+
+        # Which pass the readings in hand were asked for, and what the wide
+        # one came to. The close pass reads after the wide one has been
+        # acted on, so whether the recordings are anywhere near each other
+        # is the wide pass's to say, and it is worth saying where it could
+        # not: the close pass then has only its own snippet to go on.
+        self._pass = CLOSE_PASS
+        self._wide_result = None
+
+        # One window on the shared clock for every strip in the dialog, and
+        # one zero for them to be read against: the moment the sound was read
+        # around, which is where the videos were when it was read and stays
+        # put while the offsets are tuned under it. Both are the dialog's to
+        # keep -- see _ClockStrip.
         self._view_center_ms = None
         self._view_window_ms = DEFAULT_WINDOW_MS
+        self._zero_ms = None
 
         self._measure = AlignMeasure(parent=self)
-        self._measure.measured.connect(self._measured)
-
-        # every string that goes into a widget is built on a line of its own
-        # first: `pylupdate5` reads the text of a `translate()` call only when
-        # it begins on the same line as the context, and the formatter moves
-        # the text off that line for any call that does not fit on one line --
-        # which every call nested inside another one is. See `# fmt: skip`
-        # below, and translate_extraction in `tests/`.
-        axis_note_txt = self._axis_note_txt()
-        self._axis_note = QLabel(axis_note_txt)
-        self._axis_note.setWordWrap(True)
+        self._measure.measured.connect(self._on_measured)
+        self._measure.progress.connect(self._on_progress)
 
         self._view_note = QLabel()
         self._view_note.setWordWrap(True)
@@ -229,38 +306,58 @@ class AlignVideosDialog(QDialog):
             140,
         )
 
-        align_tooltip = translate(
-            "Dialog - Align Videos", "Take every other video to the moment the one"
-            " in Align to is on now"
+        read_tooltip = translate(
+            "Dialog - Align Videos", "Read the sound of every file around where the"
+            " videos are and draw it, moving nothing"
         )  # fmt: skip
 
-        self._align_button = self._button(
-            self._align_button_txt(),
-            align_tooltip,
-            self._doing(self._align_others),
-            ALIGN_BUTTON_WIDTH,
+        self._read_button = self._button(
+            translate("Dialog - Align Videos", "Read Sound"),
+            read_tooltip,
+            self._doing(self._read_sound),
+            140,
         )
+
+        mode_tooltip = translate(
+            "Dialog - Align Videos", "Line the videos up by their sync points: this"
+            " dialog needs it on to move anything"
+        )  # fmt: skip
+
+        self._mode_check = QCheckBox(translate("Seek Sync", "Sync Offset"))
+        self._mode_check.setToolTip(mode_tooltip)
+        self._mode_check.setChecked(self._offset_mode())
+        self._mode_check.toggled.connect(self._when_offset_mode_toggled)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Close, Qt.Horizontal, self)
         buttons.rejected.connect(self.close)
 
         actions = QHBoxLayout()
         actions.addWidget(self._auto_button)
-        actions.addWidget(self._align_button)
+        actions.addWidget(self._read_button)
+        actions.addSpacing(ACTION_GROUP_GAP)
+        actions.addWidget(self._mode_check)
         actions.addStretch(1)
         actions.addWidget(buttons)
 
         caption = QHBoxLayout()
-        caption.addWidget(self._axis_note)
         caption.addStretch(1)
         caption.addWidget(self._view_note)
         caption.addWidget(self._fit_button)
 
+        self._build_step()
+
+        self._overview = SyncOverviewStrip()
+        self._overview.view_changed.connect(self._on_view_changed)
+
+        self._grid.addWidget(self._overview, OVERVIEW_ROW, 0, 1, MOVES_COLUMN + 1)
+
+        self._hints = self._explain()
+
         layout = QVBoxLayout(self)
-        layout.addWidget(self._explain())
+        layout.addWidget(self._hints)
         layout.addWidget(self._mode_note)
-        layout.addLayout(self._grid)
         layout.addLayout(caption)
+        layout.addLayout(self._grid)
         layout.addWidget(self._sound_note)
         layout.addStretch(1)
         layout.addLayout(actions)
@@ -272,35 +369,111 @@ class AlignVideosDialog(QDialog):
 
         self._refresh()
 
-    @staticmethod
-    def _axis_note_txt() -> str:
-        return translate(
-            "Dialog - Align Videos", "Each strip: the reference's sound with that"
-            " video's over it, and seconds running from zero, the middle of the"
-            " reference's sound."
-        )  # fmt: skip
-
     def _explain(self) -> QLabel:
-        text = translate(
-            "Dialog - Align Videos", "Pause the videos and press Align By Sound: it"
-            " reads the sound of every file, works the offsets out and moves them"
-            " onto the moment they share. Where its answer is not to be trusted,"
-            " line them up by hand instead: choose the video to align the rest to"
-            " under Align to, put it on a moment they all recorded, and press"
-            " Align others to it. What is still out is moved one frame or one"
-            " second at a time by the buttons beside it, until the shapes in its"
-            " strip agree at zero. Set point marks where a video is by hand, for a"
-            " recording the sound cannot help with."
+        """The steps, in the order they are done, and short.
+
+        A list rather than a paragraph: what this dialog is for is a
+        procedure, and the procedure has an order to it -- read the sound,
+        look at it, move what is still out, and colour what colour is the only
+        way to tell apart. Kept to one line a step, since a hint nobody reads
+        to the end is a hint nobody has.
+
+        The controls are named by their own words and not by new ones: each
+        name is the string the widget itself is labelled with, put in by
+        `format`. A hint that says "Align By Sound" while the button says
+        something else is worse than no hint, and two strings that have to be
+        translated into the same thing are two strings that drift apart.
+
+        Numbered by the widget and not by the words, so that a step added or
+        moved later renumbers itself.
+
+        Every string is built in a statement of its own first, and the run of
+        them is joined into the markup afterwards: `pylupdate5` reads the text
+        of a `translate()` call only when it begins on the line the call opens
+        on, which a call nested inside another one does not. See `AGENTS.md`
+        and translate_extraction in `tests/`.
+        """
+
+        names = {
+            "ALIGN": self._auto_button.text(),
+            "READ": self._read_button.text(),
+            "WORKING_ON": self._working_on_txt(),
+            "MOVE_BY": self._move_by_txt(),
+            "FIT": self._fit_button.text(),
+        }
+
+        align_txt = translate(
+            "Dialog - Align Videos", "Press {ALIGN} to line the videos up, or {READ} to"
+            " look at their sound without moving anything."
         )  # fmt: skip
 
-        label = QLabel(text)
+        look_txt = translate(
+            "Dialog - Align Videos", "The strip at the top is every video's sound over"
+            " every other's, one colour each."
+        )  # fmt: skip
+
+        drag_txt = translate(
+            "Dialog - Align Videos", "Click {WORKING_ON} against a video and drag its"
+            " own strip to move that video; no other row moves."
+        )  # fmt: skip
+
+        along_txt = translate(
+            "Dialog - Align Videos", "Drag any other row's strip to look along. The"
+            " wheel zooms, and {FIT} shows all of it."
+        )  # fmt: skip
+
+        fine_txt = translate(
+            "Dialog - Align Videos", "Set {MOVE_BY}, then press - or + beside a video to"
+            " move it by that much."
+        )  # fmt: skip
+
+        colour_txt = translate(
+            "Dialog - Align Videos", "Double-click a strip to choose the colour that"
+            " video's sound is drawn in."
+        )  # fmt: skip
+
+        reach_txt = translate(
+            "Dialog - Align Videos", "{ALIGN} looks ten minutes either side of where the"
+            " videos are now."
+        )  # fmt: skip
+
+        steps = "".join(
+            f"<li>{step.format(**names)}</li>"
+            for step in (
+                align_txt,
+                look_txt,
+                drag_txt,
+                along_txt,
+                fine_txt,
+                colour_txt,
+            )
+        )
+
+        label = QLabel(f"<ol>{steps}</ol><p>{reach_txt.format(**names)}</p>")
         label.setWordWrap(True)
+        label.setTextFormat(Qt.RichText)
 
         return label
 
+    @staticmethod
+    def _working_on_txt() -> str:
+        """What the tick that says which video is being worked on is called.
+
+        Named here and in the column heading by one `translate()` call each:
+        they are the same words, and the header is built before the hints are.
+        """
+
+        return translate("Dialog - Align Videos", "Working on")
+
+    @staticmethod
+    def _move_by_txt() -> str:
+        """What the list of sizes a move can be made in is called."""
+
+        return translate("Dialog - Align Videos", "Move by")
+
     def _build_header(self):
         headers = (
-            translate("Dialog - Align Videos", "Align to"),
+            self._working_on_txt(),
             translate("Dialog - Align Videos", "Video"),
             translate("Dialog - Align Videos", "Position"),
             translate("Dialog - Align Videos", "Sync point"),
@@ -315,7 +488,99 @@ class AlignVideosDialog(QDialog):
             font.setBold(True)
             header.setFont(font)
 
-            self._grid.addWidget(header, 0, column)
+            self._grid.addWidget(header, HEADER_ROW, column)
+
+    # --- how far one press moves a video ---
+
+    def _build_step(self):
+        """The list every row's two buttons are read off, over their column.
+
+        One list for the whole dialog rather than a pair of buttons a size:
+        what is left to do by hand after lining a grid up by sound is a
+        millisecond or two, and eight buttons a row to say so is eight
+        buttons a row too many.
+        """
+
+        step_txt = self._move_by_txt()
+        self._step_note = QLabel(step_txt)
+        step_font = self._step_note.font()
+        step_font.setBold(True)
+        self._step_note.setFont(step_font)
+
+        step_tooltip = translate(
+            "Dialog - Align Videos", "How far one press of - or + moves a video"
+        )
+
+        self._step_combo = QComboBox()
+        self._step_combo.setToolTip(step_tooltip)
+
+        for amount, kind in NUDGE_STEPS:
+            self._step_combo.addItem(self._step_label(amount, kind))
+
+        self._step_combo.setCurrentIndex(self._saved_step())
+        self._step_combo.currentIndexChanged.connect(self._when_step_changed)
+
+        # the heading and the list in one column, over the two buttons they
+        # are read by: the grid stretches whatever is past the moves, and a
+        # list left out there would sit at the far edge of the dialog with
+        # its heading nowhere near it
+        step_holder = QWidget()
+        step_layout = QHBoxLayout(step_holder)
+        step_layout.setContentsMargins(0, 0, 0, 0)
+        step_layout.setSpacing(4)
+        step_layout.addWidget(self._step_note)
+        step_layout.addWidget(self._step_combo)
+
+        self._grid.addWidget(step_holder, HEADER_ROW, MOVES_COLUMN)
+
+    @staticmethod
+    def _step_label(amount: int, kind: str) -> str:
+        """What a size of move is called, in the words the rest of the sound
+        is measured in."""
+
+        if kind is FRAMES:
+            if amount == 1:
+                one_frame_txt = translate("Dialog - Align Videos", "1 frame")
+
+                return one_frame_txt
+
+            frames_txt = translate("Dialog - Align Videos", "{COUNT} frames")
+            label = frames_txt.format(COUNT=amount)
+
+            return label
+
+        if amount < 1_000:
+            millis_txt = translate("Dialog - Align Videos", "{COUNT} ms")
+            label = millis_txt.format(COUNT=amount)
+
+            return label
+
+        seconds_txt = translate("Dialog - Align Videos", "{COUNT} s")
+        label = seconds_txt.format(COUNT=amount // 1_000)
+
+        return label
+
+    @staticmethod
+    def _saved_step() -> int:
+        """Which size was being moved by last time, as far as it is still
+        one of the sizes offered."""
+
+        saved = Settings().get(NUDGE_STEP_SETTING)
+
+        return max(0, min(len(NUDGE_STEPS) - 1, int(saved)))
+
+    def _step(self) -> tuple:
+        return NUDGE_STEPS[self._step_combo.currentIndex()]
+
+    def _step_kind(self) -> str:
+        return self._step()[1]
+
+    def _when_step_changed(self, index: int):
+        """A new size: every row's buttons are worth different things now."""
+
+        Settings().set(NUDGE_STEP_SETTING, int(index))
+
+        self._refresh()
 
     # --- building and refreshing the rows ---
 
@@ -353,6 +618,8 @@ class AlignVideosDialog(QDialog):
         for block in blocks:
             self._update_row(block, by_id)
 
+        self._update_nudge_tooltips()
+        self._update_overview(by_id)
         self._update_mode_note()
         self._update_view_note(by_id)
         self._set_actions_live(by_id)
@@ -375,7 +642,7 @@ class AlignVideosDialog(QDialog):
         # two lines to a video: what it is and what can be done about it, and
         # under it the sound, drawn across the whole width -- the wider it is,
         # the more of a second of misalignment can be seen
-        labels_at = index * 2 - 1
+        labels_at = FIRST_VIDEO_ROW + (index - 1) * 2
 
         for column, (key, width) in enumerate(COLUMNS):
             if key == "align_to":
@@ -398,9 +665,12 @@ class AlignVideosDialog(QDialog):
 
         row["moves"] = moves
 
-        strip = SyncEnvelopeStrip()
+        strip = SyncSoundStrip()
         strip.view_changed.connect(self._on_view_changed)
-        strip.view_reset.connect(self._fit_view)
+        strip.color_requested.connect(self._when_color_requested(block.id))
+        strip.sound_dragged.connect(self._when_sound_dragged(block.id))
+        strip.sound_dropped.connect(self._when_sound_dropped(block.id))
+        strip.sound_drag_given_up.connect(self._when_sound_drag_given_up(block.id))
 
         self._grid.addWidget(strip, labels_at + 1, 0, 1, MOVES_COLUMN + 1)
 
@@ -408,13 +678,73 @@ class AlignVideosDialog(QDialog):
 
         return row
 
+    def _when_color_requested(self, block_id: str):
+        """A handler for a strip asking for a colour for its own video.
+
+        The signal carries nothing of its own, and the id is bound here
+        rather than read back out of the widgets: a strip knows which sound
+        it is drawing and not which video that sound was read from.
+        """
+
+        def handler():
+            self._pick_color(block_id)
+
+        return handler
+
+    def _when_sound_dragged(self, block_id: str):
+        """A handler for the video being worked on being dragged along the
+        clock.
+
+        What the drag says is where the offset would put its sound, so all
+        that is left here is to say it to the video: the sound follows the
+        finger because the offset it is drawn by follows the finger, and no
+        other row's sound moves at all.
+        """
+
+        def handler(offset_ms):
+            block = self._blocks_by_id().get(block_id)
+
+            if block is not None:
+                block.sync_offset_drag(offset_ms)
+
+        return handler
+
+    def _when_sound_dropped(self, block_id: str):
+        """A handler for a drag settling: the video goes where its sound was
+        dragged to."""
+
+        def handler():
+            block = self._blocks_by_id().get(block_id)
+
+            if block is not None:
+                block.sync_offset_drop()
+
+        return handler
+
+    def _when_sound_drag_given_up(self, block_id: str):
+        """A handler for a drag being given up: the offset goes back to what
+        it was, and nothing has been seeked anywhere to have to put right."""
+
+        def handler():
+            block = self._blocks_by_id().get(block_id)
+
+            if block is not None:
+                block.sync_offset_drag_give_up()
+
+        return handler
+
     def _make_align_radio(self, block) -> QRadioButton:
-        """The one tick that decides what everything else is measured from."""
+        """The one tick that says which video is being worked on.
+
+        Its sound is the one a drag moves, and it is the one the overview
+        draws over the rest: one video at a time, since a drag has to mean
+        one thing and the eye can only hold one of them at once.
+        """
 
         radio = QRadioButton()
         radio.setFixedWidth(ALIGN_TO_WIDTH)
         radio.setToolTip(
-            translate("Dialog - Align Videos", "Align the other videos to this one")
+            translate("Dialog - Align Videos", "Work on this video's sound")
         )
         radio.toggled.connect(self._when_checked(self._set_align_to, block.id))
 
@@ -428,10 +758,6 @@ class AlignVideosDialog(QDialog):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
 
-        set_point_tooltip = translate(
-            "Dialog - Align Videos", "Mark where this video is as the moment the"
-            " others line up on"
-        )  # fmt: skip
         reset_tooltip = translate(
             "Dialog - Align Videos", "Play this recording from its own start again"
         )
@@ -439,22 +765,8 @@ class AlignVideosDialog(QDialog):
         # every one of these goes through _doing: a bound method of a video
         # block is a wrapper taking anything, and `clicked` would find the
         # checked flag in its first argument
-        layout.addWidget(
-            self._button(
-                translate("Dialog - Align Videos", "Set point"),
-                set_point_tooltip,
-                self._doing(block.set_sync_point_here),
-                ACTION_BUTTON_WIDTH,
-            )
-        )
-
-        for text, amount in SECONDS_NUDGES:
-            layout.addWidget(self._nudge(block, text, amount, is_frames=False))
-
-        layout.addSpacing(NUDGE_GROUP_GAP)
-
-        for text, amount in FRAME_NUDGES:
-            layout.addWidget(self._nudge(block, text, amount, is_frames=True))
+        layout.addWidget(self._nudge(block, by=-1))
+        layout.addWidget(self._nudge(block, by=1))
 
         layout.addWidget(
             self._button(
@@ -467,40 +779,75 @@ class AlignVideosDialog(QDialog):
 
         return holder
 
-    def _nudge(self, block, text: str, amount: int, is_frames: bool) -> QPushButton:
-        """One move of one video, by what its label says.
+    def _nudge(self, block, by: int) -> QPushButton:
+        """One move of one video, by whatever the step is set to.
 
-        The label carries the size and the sign, so the tooltip only has to
-        say what is being moved and against what.
+        The size is not on the button: it is one list for the whole dialog,
+        above the column, and a button saying what it is worth would have to
+        be relabelled every time that list moves.
         """
 
-        if is_frames:
-            tooltip = translate(
-                "Dialog - Align Videos", "Move this recording by that many frames"
-                " against the others"
-            )  # fmt: skip
-            on_press = self._doing(block.sync_offset_shift_frames, amount)
-        else:
-            tooltip = translate(
-                "Dialog - Align Videos", "Move this recording by that many seconds"
-                " against the others"
-            )  # fmt: skip
-            on_press = self._doing(block.sync_offset_shift_ms, amount)
-
-        button = self._button(text, tooltip, on_press, NUDGE_BUTTON_WIDTH)
-
-        if is_frames:
-            button.setProperty(IS_FRAMES, True)
+        button = self._button(
+            "-" if by < 0 else "+",
+            self._nudge_tooltip(by),
+            self._doing(self._move, block, by),
+            NUDGE_BUTTON_WIDTH,
+        )
+        button.setProperty(IS_NUDGE, True)
 
         return button
+
+    def _move(self, block, by: int):
+        """Move one video by one step of whatever size is being moved by."""
+
+        amount, kind = self._step()
+
+        if kind is FRAMES:
+            block.sync_offset_shift_frames(by * amount)
+        else:
+            block.sync_offset_shift_ms(by * amount)
+
+    def _nudge_tooltip(self, by: int) -> str:
+        """What one press will do, said with the size it will do it in."""
+
+        amount, kind = self._step()
+        size = self._step_label(amount, kind)
+
+        if by > 0:
+            later_txt = translate(
+                "Dialog - Align Videos", "Move this recording {SIZE} later against"
+                " the others"
+            )  # fmt: skip
+            tooltip = later_txt
+        else:
+            earlier_txt = translate(
+                "Dialog - Align Videos", "Move this recording {SIZE} earlier against"
+                " the others"
+            )  # fmt: skip
+            tooltip = earlier_txt
+
+        return tooltip.format(SIZE=size)
+
+    def _update_nudge_tooltips(self):
+        """Say what every row's two buttons are worth now, since the step
+        they are read off may have moved."""
+
+        for row in self._rows.values():
+            for button in row["moves"].findChildren(QPushButton):
+                if not button.property(IS_NUDGE):
+                    continue
+
+                button.setToolTip(
+                    self._nudge_tooltip(-1 if button.text() == "-" else 1)
+                )
 
     @staticmethod
     def _when_checked(func, *args):
         """A handler for a tick, which only acts when the tick goes on.
 
         `toggled` fires for both directions, and the one going off is not the
-        one a finger chose: the video the others are aligned to would end up
-        being whichever row happened to be unticked last.
+        one a finger chose: the video being worked on would end up being
+        whichever row happened to be unticked last.
         """
 
         def handler(checked):
@@ -572,13 +919,104 @@ class AlignVideosDialog(QDialog):
         row["state"].setToolTip(state)
         row["match"].setText(self._match_txt(block))
 
-        row["strip"].show_pair(
-            self._sound_of(self._align_to, by_id),
+        row["strip"].show_sound(
             self._sound_of(block.id, by_id),
+            self._color_of(block),
             common_moment_ms(block.time, block.sync_offset_ms),
+            self._zero_ms,
+            is_picked=block.id == self._align_to,
         )
 
         self._set_moves_live(block, row["moves"])
+
+    def _update_overview(self, by_id):
+        """Every video's sound, one over another, with the one being worked
+        on drawn last.
+
+        Read here rather than in the rows because this is the only place two
+        recordings' sound is seen against each other: a row draws its own and
+        nothing else.
+        """
+
+        drawn = [
+            DrawnSound(
+                sound=self._sound_of(block.id, by_id),
+                colour=self._color_of(block),
+                is_picked=block.id == self._align_to,
+            )
+            for block in by_id.values()
+        ]
+
+        self._overview.show_sounds(
+            [one for one in drawn if one.sound is not None],
+            self._now_ms(by_id),
+            self._zero_ms,
+        )
+
+    def _now_ms(self, by_id) -> int | None:
+        """The moment the video being worked on is on now, which is the one
+        line the overview draws: one line per video would be one line too
+        many to read."""
+
+        block = by_id.get(self._align_to)
+
+        if block is None:
+            return None
+
+        return common_moment_ms(block.time, block.sync_offset_ms)
+
+    def _color_of(self, block) -> str:
+        """What colour this video's sound is drawn in.
+
+        Named by hand once and remembered against the file, so that the same
+        recording is the same colour in the next dialog it is opened in; and
+        taken from the palette until then, one per video and not one that
+        another video of this dialog is already drawn in.
+        """
+
+        colour = self._colors.get(block.id)
+
+        if colour is not None:
+            return colour
+
+        colour = spectrum_color(block.video_params.uri) or self._unused_color()
+
+        self._colors[block.id] = colour
+
+        return colour
+
+    def _unused_color(self) -> str:
+        """The first colour of the palette nothing else here is drawn in."""
+
+        taken = set(self._colors.values())
+
+        for colour in SPECTRUM_COLORS:
+            if colour not in taken:
+                return colour
+
+        # more videos than colours: round again rather than draw two of them
+        # in nothing at all
+        return SPECTRUM_COLORS[len(self._colors) % len(SPECTRUM_COLORS)]
+
+    def _pick_color(self, block_id: str):
+        """Ask for a colour for one video's sound, and remember it for the
+        file it was read from."""
+
+        block = self._blocks_by_id().get(block_id)
+
+        if block is None:
+            return
+
+        picked = color_picked_by_hand(self, self._color_of(block))
+
+        if picked is None:
+            return
+
+        remember_spectrum_color(block.video_params.uri, picked)
+
+        self._colors[block_id] = picked
+
+        self._refresh()
 
     def _sound_of(self, block_id, by_id):
         """One video's reading, as its offset stands at this moment.
@@ -669,32 +1107,26 @@ class AlignVideosDialog(QDialog):
     def _set_moves_live(self, block, moves: QWidget):
         """What each move needs before it can do anything.
 
-        A video offers no move in frames without a frame rate to go by, and no
-        move of any kind until it has loaded.
+        A video offers no move in frames without a frame rate to go by --
+        which is a question about the video *and* about the size being moved
+        by, since the size is the dialog's now -- and no move of any kind
+        until it has loaded.
         """
 
         is_seekable = block.is_video_initialized and not block.is_live
         in_frames = block.is_sync_offset_in_frames
+        moves_frames = self._step_kind() is FRAMES
 
         for button in moves.findChildren(QPushButton):
-            wants_frames = bool(button.property(IS_FRAMES))
+            if not button.property(IS_NUDGE):
+                button.setEnabled(is_seekable)
 
-            button.setEnabled(is_seekable and (in_frames or not wants_frames))
+                continue
+
+            button.setEnabled(is_seekable and (in_frames or not moves_frames))
 
     def _set_actions_live(self, by_id):
-        """What the two dialog-wide moves need."""
-
-        is_offset_mode = self._offset_mode()
-        is_seekable = any(
-            block.is_video_initialized and not block.is_live for block in by_id.values()
-        )
-
-        self._align_button.setEnabled(
-            is_seekable
-            and is_offset_mode
-            and self._align_to in by_id
-            and len(by_id) > 1
-        )
+        """What the dialog-wide moves need."""
 
         self._fit_button.setEnabled(
             any(reading.envelope for reading in self._readings.values())
@@ -706,57 +1138,23 @@ class AlignVideosDialog(QDialog):
 
         return bool(self._is_offset_mode())
 
-    # --- what is aligned to what ---
+    # --- which video is being worked on ---
 
     def _set_align_to(self, block_id, refresh=True, by_id=None):
-        """Choose the video the rest are aligned to, and say so on the button."""
+        """Choose the video being worked on: the one a drag moves, and the one
+        the overview draws over the rest."""
 
         self._align_to = block_id
 
-        self._align_button.setText(
-            self._align_button_txt(by_id if by_id is not None else self._blocks_by_id())
-        )
-
         if refresh:
             self._refresh()
-
-    def _align_button_txt(self, by_id=None) -> str:
-        """Named, not a bare verb: which video the others go to is the whole
-        of what the button does, and it is not always the one it was.
-
-        Named only where the grid has been looked at: this is asked for
-        while the button is being built, before there is anything to name.
-        """
-
-        if by_id is None:
-            return translate("Dialog - Align Videos", "Align others to it")
-
-        if self._align_to not in by_id:
-            return translate("Dialog - Align Videos", "Align others to it")
-
-        return translate("Dialog - Align Videos", "Align others to {NAME}").format(
-            NAME=self._name_of(self._align_to, by_id)
-        )
-
-    def _align_others(self):
-        """Take every other video to the moment the chosen one is on.
-
-        What a seek already does, sent for a video that has been put where it
-        wanted to be rather than moved there: the offsets are what carry it,
-        so nothing here needs to know them.
-        """
-
-        block = self._blocks_by_id().get(self._align_to)
-
-        if block is not None:
-            block.sync_offset_align_others()
 
     def _blocks_by_id(self) -> dict:
         return {block.id: block for block in self._blocks()}
 
     def _name_of(self, block_id, by_id) -> str:
-        """What to call a video in the note and on the button, kept short
-        enough to read a list of."""
+        """What to call a video in the note, kept short enough to read a list
+        of."""
 
         block = by_id.get(block_id)
 
@@ -784,6 +1182,8 @@ class AlignVideosDialog(QDialog):
     def _apply_view(self, center_ms: int, window_ms: int):
         self._view_center_ms = int(center_ms)
         self._view_window_ms = int(window_ms)
+
+        self._overview.set_view(self._view_center_ms, self._view_window_ms)
 
         for row in self._rows.values():
             row["strip"].set_view(self._view_center_ms, self._view_window_ms)
@@ -886,14 +1286,9 @@ class AlignVideosDialog(QDialog):
         if self._measure.is_running:
             return
 
-        blocks = [block for block in self._blocks() if self._can_measure(block)]
+        blocks = self._measurable()
 
-        if len(blocks) < 2:
-            needs_two = translate(
-                "Dialog - Align Videos", "Lining up by sound needs two videos that"
-                " are files on this machine."
-            )  # fmt: skip
-            self._set_sound_note(needs_two)
+        if blocks is None:
             return
 
         # what the last reading came to is left on show while the next one is
@@ -904,18 +1299,243 @@ class AlignVideosDialog(QDialog):
         # measured against these, and applying it to anything else would be
         # answering a question nobody asked
         self._measured_offsets = {block.id: block.sync_offset_ms for block in blocks}
+        self._wide_result = None
 
-        self._auto_button.setEnabled(False)
+        self._set_reading(True)
+
+        # minutes of every recording first, since a misalignment of minutes
+        # is not something a snippet read around the moment can see at all
+        self._pass = WIDE_PASS
         self._set_sound_note(translate("Dialog - Align Videos", "Reading the sound…"))
 
-        self._measure.start(
-            [(block.id, str(block.video_params.uri), block.time) for block in blocks]
+        if not self._read(blocks, WIDE_READ_MS, COARSE_SCALE.blocks_per_sec):
+            self._set_reading(False)
+
+    def _read_sound(self):
+        """Read the sound of every file around where the videos are, and draw it.
+
+        The strips only have something to draw once the sound has been read,
+        and reading it is the first thing lining up by sound does -- so a
+        viewer who wants to look at the sound, or to look again after moving a
+        video by hand, had to press a button that also lines the videos up and
+        moves their offsets. This is that reading on its own: nothing is
+        judged, no offset is changed and no video is seeked, so it is the same
+        thing to do whatever mode the grid is in.
+        """
+
+        if self._measure.is_running:
+            return
+
+        blocks = self._measurable()
+
+        if blocks is None:
+            return
+
+        self._pass = SOUND_PASS
+        self._set_reading(True)
+        self._set_sound_note(translate("Dialog - Align Videos", "Reading the sound…"))
+
+        if not self._read(blocks, FINE_SNIPPET_MS, BLOCKS_PER_SEC):
+            self._set_reading(False)
+
+    def _measurable(self) -> list | None:
+        """The videos there is a reading to be had from, or None and a note.
+
+        Reading needs two of them and only files on this machine: see
+        `_can_measure`.
+        """
+
+        blocks = [block for block in self._blocks() if self._can_measure(block)]
+
+        if len(blocks) >= 2:
+            return blocks
+
+        needs_two = translate(
+            "Dialog - Align Videos", "Reading the sound needs two videos that are"
+            " files on this machine."
+        )  # fmt: skip
+        self._set_sound_note(needs_two)
+
+        return None
+
+    def _set_reading(self, is_reading: bool):
+        """Whether the two buttons that start a run can start one."""
+
+        self._auto_button.setEnabled(not is_reading)
+        self._read_button.setEnabled(not is_reading)
+
+    def _read(self, blocks, snippet_ms: int, blocks_per_sec: int) -> bool:
+        """Ask for a reading of every one of these, at this size.
+
+        The video's own position is what is read around, which is what makes
+        the two passes line up: the wide reading covers the whole range the
+        search looks over either side of it, and the close reading covers
+        the snippet the wide one already decoded.
+        """
+
+        return self._measure.start(
+            [
+                ReadingRequest(
+                    block_id=block.id,
+                    uri=str(block.video_params.uri),
+                    center_ms=block.time,
+                    snippet_ms=snippet_ms,
+                    blocks_per_sec=blocks_per_sec,
+                )
+                for block in blocks
+            ]
         )
+
+    def _on_progress(self, done: int, total: int, block_id: str):
+        """How far a run of readings has got, said with the name of the file
+        that just came back.
+
+        Said at all because the wide reading of a five-hour recording takes
+        tens of seconds, and a note that only ever says "reading" is one
+        that cannot be told from a dialog that has stopped.
+        """
+
+        by_id = self._blocks_by_id()
+
+        if self._pass == CLOSE_PASS:
+            reading_txt = translate(
+                "Dialog - Align Videos", "Reading the sound closely… {DONE} of"
+                " {TOTAL} ({NAME})"
+            )  # fmt: skip
+        else:
+            reading_txt = translate(
+                "Dialog - Align Videos", "Reading the sound… {DONE} of {TOTAL}"
+                " ({NAME})"
+            )  # fmt: skip
+
+        self._set_sound_note(
+            reading_txt.format(
+                DONE=done, TOTAL=total, NAME=self._name_of(block_id, by_id)
+            )
+        )
+
+    def _on_measured(self, readings):
+        """A run of readings is in: what is done with them depends on what
+        asked for them."""
+
+        if self._pass == WIDE_PASS:
+            self._measured_wide(readings)
+        elif self._pass == SOUND_PASS:
+            self._measured_sound(readings)
+        else:
+            self._measured(readings)
+
+    def _measured_wide(self, readings):
+        """What the sound of minutes of every recording came to.
+
+        Every pair of them is compared at a block a second, and the answers
+        are put to the videos: which of them the others agree with first, so
+        that the snippet the close pass reads is read around a moment that
+        already means the same thing in all of them.
+
+        Where nothing agreed, the close pass is read anyway, over the moment
+        each video is on: a misalignment small enough for a snippet to see is
+        one the wide pass was never needed for.
+        """
+
+        by_id = self._blocks_by_id()
+
+        result = align(
+            readings,
+            self._measured_offsets,
+            [block.id for block in by_id.values() if self._can_measure(block)],
+            scale=COARSE_SCALE,
+        )
+
+        self._wide_result = result
+
+        reference = by_id.get(result.reference_id)
+
+        if reference is not None:
+            for alignment in result.alignments:
+                block = by_id.get(alignment.block_id)
+
+                if block is None:
+                    continue
+
+                was = self._measured_offsets.get(alignment.block_id, 0)
+
+                block.sync_offset_set(was + alignment.shift_ms)
+
+            # And then put them where those offsets say they should be: the
+            # close pass reads around the position each video is on, and a
+            # video left on the moment it was already showing would have its
+            # snippet read around sound nobody else recorded.
+            reference.sync_offset_align_others()
+
+        self._start_close_pass()
+
+    def _start_close_pass(self):
+        """Read the snippet the close pass works on, around where the videos
+        are now."""
+
+        blocks = [block for block in self._blocks() if self._can_measure(block)]
+
+        self._pass = CLOSE_PASS
+        self._measured_offsets = {block.id: block.sync_offset_ms for block in blocks}
+
+        close_txt = translate(
+            "Dialog - Align Videos", "Reading the sound closely…"
+        )  # fmt: skip
+        self._set_sound_note(close_txt)
+
+        if self._read(blocks, FINE_SNIPPET_MS, BLOCKS_PER_SEC):
+            return
+
+        # nothing was asked for, so what the wide pass alone came to is all
+        # there is to say
+        self._set_reading(False)
+
+        if self._wide_result is not None:
+            self._report(self._wide_result, self._blocks_by_id())
+
+    def _measured_sound(self, readings):
+        """The sound, read and drawn, with nothing judged and nothing moved.
+
+        The ruler is measured from the video being worked on: nothing was
+        lined up, so there is no recording the rest were judged against to
+        take it from, and the one the viewer is pointing at is the one whose
+        sound they asked to look at.
+        """
+
+        self._set_reading(False)
+
+        by_id = self._blocks_by_id()
+
+        # kept for the strips, which is the whole of what this run is for
+        self._readings = readings
+        self._sounds = {}
+
+        self._zero_ms = self._zero_of(self._align_to, by_id)
+
+        self._fit_view()
+
+        read_txt = translate(
+            "Dialog - Align Videos", "Read the sound of {READ} of {ASKED} files."
+            " Nothing has been moved."
+        )  # fmt: skip
+
+        self._set_sound_note(read_txt.format(READ=len(readings), ASKED=len(by_id)))
+
+        self._refresh()
+
+    def _zero_of(self, block_id, by_id) -> int | None:
+        """The moment a video's own sound was read around, which is what the
+        ruler is measured from where nothing has been lined up yet."""
+
+        sound = self._sound_of(block_id, by_id)
+
+        return None if sound is None else sound.read_around_ms
 
     def _measured(self, readings):
         """What the sound said, put to the videos it was read from."""
 
-        self._auto_button.setEnabled(True)
+        self._set_reading(False)
 
         blocks = self._blocks()
         by_id = {block.id: block for block in blocks}
@@ -963,6 +1583,12 @@ class AlignVideosDialog(QDialog):
         if reference is not None:
             reference.sync_offset_align_others()
 
+            # Zero is the moment the sound was read around, and it is the
+            # reference's because every one of these readings was taken
+            # around where that video stood: the offsets are tuned under it,
+            # and it does not move while they are.
+            self._zero_ms = common_moment_ms(reference.time, reference.sync_offset_ms)
+
         # a new reading is a new stretch of the recordings: show the whole of
         # it rather than whatever was being looked at before
         self._fit_view()
@@ -978,6 +1604,15 @@ class AlignVideosDialog(QDialog):
         offsets would go on telling. One that was left for any other reason is
         named with the reason, since from the outside "it did not move" looks
         the same whichever way it came about.
+
+        Both passes are accounted for, and not only the last of them. The
+        close pass is the one that places a lag to the millisecond, so its
+        answer is the one worth leading with -- but the wide pass has been
+        over minutes of every recording by then and may well have moved them
+        already. Saying only what the close pass made of its snippet reads as
+        though nothing had happened at all, which is exactly what a viewer
+        sees after lining a grid up by the minutes and then pausing somewhere
+        only one of the recordings covers.
         """
 
         heard = [
@@ -994,20 +1629,100 @@ class AlignVideosDialog(QDialog):
             self._set_sound_note(nothing_read)
             return
 
+        if result.reference_id is None:
+            self._set_sound_note(self._nothing_close_note(result, by_id))
+            return
+
+        note = self._lined_up_note(result, by_id)
+
+        left = self._left_note(result, by_id)
+
+        self._set_sound_note(self._with_wide_note(f"{note} {left}" if left else note))
+
+    def _lined_up_note(self, result, by_id) -> str:
+        """What the close pass did, said with the recording it judged by."""
+
         lined_up = translate(
             "Dialog - Align Videos", "Lined up {ALIGNED} of {OTHERS} by sound, judged"
             " against {NAME}."
         )  # fmt: skip
 
-        note = lined_up.format(
+        return lined_up.format(
             ALIGNED=len(result.alignments),
             OTHERS=len(result.verdicts) - 1,
             NAME=self._name_of(result.reference_id, by_id),
         )
 
+    def _nothing_close_note(self, result, by_id) -> str:
+        """What to say where the close pass trusted none of them.
+
+        Two things can have happened, and they read very differently from the
+        outside: the wide pass may have lined them up and left nothing for the
+        close one to say about the moment they are on, or nothing anywhere may
+        have matched. Both are said for what they are.
+        """
+
+        wide = self._wide_result
+
+        if wide is not None and wide.reference_id is not None:
+            wide_txt = translate(
+                "Dialog - Align Videos", "Lined up to within a second over the"
+                " minutes either side, judged against {NAME}, but nothing like that"
+                " was heard around the moment the videos are on now."
+            )  # fmt: skip
+
+            note = wide_txt.format(
+                NAME=self._name_of(wide.reference_id, by_id),
+            )
+
+            again_txt = translate(
+                "Dialog - Align Videos", "Move the videos to a moment they both hold"
+                " and press Align By Sound again."
+            )  # fmt: skip
+
+            return f"{note} {again_txt}"
+
+        if wide is not None:
+            nothing_lined = translate(
+                "Dialog - Align Videos", "Nothing was lined up: no recording was found"
+                " that the others agreed with."
+            )  # fmt: skip
+
+            return self._with_wide_note(nothing_lined)
+
+        # the close pass on its own, which is what a dialog asked for the
+        # sound before this one was ever read comes to
+        return self._left_note_only(result, by_id)
+
+    def _left_note_only(self, result, by_id) -> str:
+        nothing_lined = translate(
+            "Dialog - Align Videos", "Nothing was lined up: no recording was found"
+            " that the others agreed with."
+        )  # fmt: skip
+
         left = self._left_note(result, by_id)
 
-        self._set_sound_note(f"{note} {left}" if left else note)
+        return f"{nothing_lined} {left}" if left else nothing_lined
+
+    def _with_wide_note(self, note: str) -> str:
+        """The note, and what the pass over minutes of the recordings came to
+        where it came to nothing.
+
+        Said because the close pass then has only its own snippet to go on:
+        recordings more than ten minutes apart, or with nothing in common
+        across a quarter of an hour of them, read from the outside exactly
+        like a sound that matched nothing at all.
+        """
+
+        if self._wide_result is None or self._wide_result.reference_id is not None:
+            return note
+
+        nothing_wide = translate(
+            "Dialog - Align Videos", "Nothing in the minutes either side of it"
+            " matched, so only a few seconds either way was looked over."
+        )  # fmt: skip
+
+        return f"{note} {nothing_wide}"
 
     def _left_note(self, result, by_id) -> str:
         """Which of them were left where they were, and why each was."""
@@ -1073,16 +1788,42 @@ class AlignVideosDialog(QDialog):
         self._sound_note.setText(text)
 
     def _update_mode_note(self):
-        is_missing = self._is_offset_mode is not None and not self._offset_mode()
+        """Say that the mode is off, and keep the tick in step with it.
 
-        self._mode_note.setVisible(is_missing)
+        The tick is the menu's setting as well as this dialog's: the mode can
+        be turned on or off from the right-click menu while this is open, and
+        a tick that went on saying otherwise would be the dialog disagreeing
+        with the grid it is lining up.
+        """
 
-        if is_missing:
+        is_off = self._is_offset_mode is not None and not self._offset_mode()
+
+        self._mode_note.setVisible(is_off)
+
+        if is_off:
             needs_mode = translate(
-                "Dialog - Align Videos", "Align needs Sync Offset mode, which is off."
-                " Turn it on under Seek Sync in the right-click menu."
+                "Dialog - Align Videos", "Aligning needs Sync Offset, which is off."
+                " Nothing can be moved until it is on."
             )  # fmt: skip
             self._mode_note.setText(needs_mode)
+
+        if self._set_offset_mode is not None:
+            with QSignalBlocker(self._mode_check):
+                self._mode_check.setChecked(not is_off)
+
+    def _when_offset_mode_toggled(self, is_on: bool):
+        """The tick was clicked: the mode follows it.
+
+        Nothing here knows what the mode was before: turning Sync Offset off
+        puts back whichever mode was in force when this turned it on, which is
+        the business of whoever owns the setting. See
+        `VideoBlocksManager._set_offset_mode`.
+        """
+
+        if self._set_offset_mode is not None:
+            self._set_offset_mode(is_on)
+
+        self._update_mode_note()
 
     # --- lifecycle ---
 
