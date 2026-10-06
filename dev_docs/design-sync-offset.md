@@ -432,9 +432,9 @@ P5 之后又改了三处，都在 [roadmap.md](roadmap.md) 的第 3~5 项里，
 只登记、微调只动被点的那一路）；底部那个 Align 是"以选中的那一路为准去动别人"，
 等价于在那儿 seek 一次。
 
-界面文字全部走 `translate("Dialog - Align Videos", …)`，**目前只有英文**：
-`.ts` 由 Crowdin 管，到下一次翻译同步之前新界面不会有译文（见
-[known-issues-and-risks.md](known-issues-and-risks.md)）。重做时顺手把一个更根本的
+界面文字全部走 `translate("Dialog - Align Videos", …)`。翻译现在在本仓库里做
+（[translations.md](translations.md)）：这一版的 46 条已进 `zh_CN.ts` 并译成中文，
+其它语言要等各自的 `.ts` 用 `scripts/translations/update_ts.py` 补齐。重做时顺手把一个更根本的
 问题也修了：`pylupdate5` **只读"文本与上下文在同一行开头"的那种 `translate()`**，
 而 `ruff format` 会把放不下的一律拆开、把文本挤到下一行——于是这类字符串
 在任何语言里都永远是英文。对齐对话框这 18 处已按 `AGENTS.md` 里的写法修好

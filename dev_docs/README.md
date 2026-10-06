@@ -25,6 +25,7 @@ is written for people changing the **code**.
 | See what is fragile or unfinished | [known-issues-and-risks.md](known-issues-and-risks.md) |
 | Work on multi-camera sync alignment | [design-sync-offset.md](design-sync-offset.md) |
 | Work on the audio matching itself | [audio-alignment.md](audio-alignment.md) |
+| Translate the interface, or top a language up | [translations.md](translations.md) |
 | See what is planned next, and what was decided against | [roadmap.md](roadmap.md) |
 
 ## The one-paragraph summary
@@ -80,7 +81,7 @@ gridplayer/            application package
 resources/             raw sources for the generated resources
 ├── ui/                Qt Designer .ui files  → *_ui.py via `just generate-ui`
 ├── icons/, fonts/     artwork compiled into resources via `just generate-resources`
-└── translations/      .ts sources (managed on Crowdin — do not edit)
+└── translations/      .ts sources, edited here — see dev_docs/translations.md
 
 scripts/               build/packaging for each platform + translations tooling
 tests/                 pytest suite (~25k lines) driving the real application
@@ -95,8 +96,9 @@ hard-to-diagnose breakage:
 1. **Do not create commits or push** unless explicitly asked.
 2. `gridplayer/resources/` is **generated**. Edit `resources/` and run
    `just generate-resources`.
-3. **Translations are managed externally.** Do not modify `.ts`/`.qm` files,
-   `scripts/translations/*`, or run `just translations-*`.
+3. **Translations are edited here.** `resources/translations/*.ts` are the
+   sources and `gridplayer/resources/translations/*.qm` are compiled from them
+   with `lrelease`. See [translations.md](translations.md).
 4. `gridplayer/vlc_player/vlc.py` is a **vendored** copy of the python-vlc
    binding. Do not modify it.
 5. Files matching `*_ui.py` are generated from `.ui` sources. Edit the `.ui` file

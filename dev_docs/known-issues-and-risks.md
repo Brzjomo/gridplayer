@@ -185,16 +185,15 @@ builds succeeding.
 * **Translation timing.** `tests/test_translation_timing.py` guards it, but the
   failure mode is subtle: a module-level `translate()` bakes in English
   permanently, and this is how every menu entry once came out in English.
-* **New UI is English until the next translation round.** `.ts` files are
-  managed on Crowdin and are never edited here, so a string added to the source
-  shows in English in every language until somebody runs the translation update
-  ([build-and-release.md](build-and-release.md), `scripts/translations/`).
-  Measured when the alignment dialog was reworked: **no `.ts` in the tree
-  contains the `Dialog - Align Videos` context at all**, so that whole dialog —
-  every label, button and note — is English in every language, including the
-  ones that are otherwise fully translated. Its 46 strings are extractable now
-  (`pylupdate5`, checked), which is the precondition for the round picking them
-  up at all.
+* **A language falls behind as the code grows.** Catalogs are edited here now
+  ([translations.md](translations.md)), so a string added to the source shows in
+  English in a language until its `.ts` is topped up with
+  `scripts/translations/update_ts.py`. Measured when this changed: the code had
+  **960** strings and every catalog in the tree held **305**, so 617 — the whole
+  alignment dialog, most of the settings form, the checkup and keymap dialogs —
+  had never been in *any* catalog, English template included. `zh_CN` was topped
+  up and translated in the same change; the other languages are still at 305 and
+  fall back to English for those strings.
 * **Strings the extractor cannot see.** `pylupdate5` reads a call's text only
   where that text *begins on the same line as the context*. `ruff format` splits
   any call that does not fit on one line, which puts the text on the next line,

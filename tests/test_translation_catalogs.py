@@ -1,0 +1,127 @@
+"""Every catalog the application can load has to be carried into the build.
+
+`init_translator()` looks for two kinds of catalog under
+`gridplayer/resources/translations`: this project's own, one `.qm` per language,
+and Qt's, asked for as `qtbase_<language>.qm`. That directory is generated from
+`resources/resources.csv`, so a catalog sitting in `resources/translations` with
+no row in the manifest is a catalog a packaged build does not have — which is
+how a language can look translated in a checkout and be English in a build.
+
+The Qt one is here because it is the case that actually happened: **no Qt
+release ships a `qtbase_zh_CN.qm`**, and the translation is all but complete
+upstream, so this repository carries a compiled one. See
+`dev_docs/translations.md`.
+"""
+
+import csv
+from pathlib import Path
+
+from gridplayer.main import init_translator as init_translator_module
+from gridplayer.params import env
+
+REPO = Path(__file__).resolve().parent.parent
+
+SOURCES = REPO / "resources" / "translations"
+GENERATED = REPO / "gridplayer" / "resources"
+MANIFEST = REPO / "resources" / "resources.csv"
+
+# the catalog the Crowdin recipes regenerate: the source text itself, not a
+# translation of it, and the application asks for nothing when the language is
+# English
+TEMPLATE = "en_US.ts"
+
+QT_CATALOG = "translations/qtbase_zh_CN.qm"
+
+
+def _carried() -> list[tuple[str, str, str]]:
+    """The manifest's translation-shaped rows: (type, source, name)."""
+
+    rows = []
+
+    with MANIFEST.open(newline="", encoding="utf-8") as handle:
+        for f_type, f_path, f_name in csv.reader(handle):
+            if f_type == "translation" or f_path.startswith("translations/"):
+                rows.append((f_type, f_path, f_name))
+
+    return rows
+
+
+def _generated(f_type: str, f_name: str) -> Path:
+    """Where a row ends up: a .ts is compiled, a file is copied."""
+
+    if f_type == "translation":
+        return GENERATED / "translations" / f"{f_name}.qm"
+
+    return GENERATED / f_name
+
+
+def test_every_source_catalog_is_in_the_manifest():
+    """A .ts nobody listed is a language nobody gets."""
+
+    shipped = {
+        f"translations/{path.name}"
+        for path in SOURCES.glob("*.ts")
+        if path.name != TEMPLATE
+    }
+
+    listed = {
+        f_path for _f_type, f_path, _f_name in _carried() if f_path.endswith(".ts")
+    }
+
+    assert shipped == listed
+
+
+def test_the_carried_qt_catalog_is_where_it_is_asked_for():
+    """Qt ships no Simplified Chinese catalog; this application ships one."""
+
+    assert QT_CATALOG in {f_path for _f_type, f_path, _f_name in _carried()}
+    assert (SOURCES / "qtbase_zh_CN.qm").is_file()
+    assert (GENERATED / "translations" / "qtbase_zh_CN.qm").is_file()
+
+
+def test_the_generated_catalogs_are_all_there():
+    """Generated resources are committed, so a catalog missing its .qm means the
+    .ts was changed without `lrelease` having run over it."""
+
+    missing = [
+        f_name
+        for f_type, _f_path, f_name in _carried()
+        if not _generated(f_type, f_name).is_file()
+    ]
+
+    assert missing == []
+
+
+def test_qt_strings_are_looked_for_in_the_application_first(monkeypatch):
+    """Before the Qt the machine happens to have, because a PyQt5 wheel has no
+    `qtbase_zh_CN.qm` in it and the machine may have no Qt of its own at all."""
+
+    asked = []
+
+    class RecordingTranslator:
+        def __init__(self, parent=None):
+            pass
+
+        def load(self, *args):
+            asked.append(args)
+
+            return False
+
+    class Chinese:
+        def get(self, key):
+            return "zh_CN"
+
+    monkeypatch.setattr(init_translator_module, "QTranslator", RecordingTranslator)
+    monkeypatch.setattr(init_translator_module, "Settings", Chinese)
+
+    # nothing is installed: both loads fail, and only the asking is under test
+    init_translator_module.init_translator(None)
+
+    # load(locale, "qtbase_", "", directory) twice -- the application's own
+    # copy, then the Qt the machine has -- and then the application's own
+    # catalog, load(language, directory)
+    assert [call[1] for call in asked[:2]] == ["qtbase_", "qtbase_"]
+    assert asked[0][3] == str(env.RESOURCES_DIR / "translations")
+    assert asked[1][3] != asked[0][3]
+    assert asked[2][0] == "zh_CN"
+    assert asked[2][1] == str(env.RESOURCES_DIR / "translations")

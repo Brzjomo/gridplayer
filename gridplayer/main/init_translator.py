@@ -23,8 +23,18 @@ def init_translator(app):
         qt_translations_path = QLibraryInfo.location(QLibraryInfo.TranslationsPath)
     log.debug(f"QT translations path: {qt_translations_path}")
 
+    # Qt's own strings are asked for in two places: what this application
+    # ships, then the Qt the machine has. The application's own copy is what
+    # makes Simplified Chinese possible at all -- neither a PyQt5 wheel nor a
+    # Qt release carries a qtbase_zh_CN.qm, while the translation itself is
+    # all but complete upstream. See dev_docs/translations.md.
+    qt_paths = (
+        str(env.RESOURCES_DIR / "translations"),
+        qt_translations_path,
+    )
+
     translator_qt = QTranslator(app)
-    if translator_qt.load(QLocale(lang), "qtbase_", "", qt_translations_path):
+    if any(translator_qt.load(QLocale(lang), "qtbase_", "", path) for path in qt_paths):
         app.installTranslator(translator_qt)
     else:
         log.warning(f"Failed to load QT translation for {lang}")
