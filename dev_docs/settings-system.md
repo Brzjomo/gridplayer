@@ -213,6 +213,21 @@ mixes two mechanisms:
 So *most* settings are added purely as data, and only those needing a custom
 widget touch `settings_map` and the `.ui` file.
 
+### Settings with no row in the form at all
+
+Two of the settings a user changes are changed somewhere else entirely, and so
+appear in neither `settings_map` nor a `DefaultsForm`:
+
+| Key | Written by | Shape |
+| --- | --- | --- |
+| `playlist/spectrum_colors` | Double-clicking a strip in the alignment dialog | A `SpectrumColors` model: file path → `#rrggbb`. A pydantic model is the only way a `dict` is stored here — `_get_storage_value` writes it as JSON, the way `player/keymap` is written |
+| `playlist/sync_nudge_step` | The `Move by` list in the alignment dialog | An index into that dialog's own tuple of sizes, clamped on read: the list may have grown since |
+
+Both are `Settings` rather than `PlaylistSettings`: a colour belongs to the file
+and not to the playlist it was seen in, and the size a move is being made in is
+a preference about the dialog. Neither is in `get_all`'s way — a key with no row
+is simply never rendered.
+
 `load_settings` / `save_settings` (`dialogs/settings.py:827`, `:864`) do the
 round trip. Note `_is_session_driver_kept`: changing the video driver mid-session
 is handled so the running session's driver is not silently swapped underneath

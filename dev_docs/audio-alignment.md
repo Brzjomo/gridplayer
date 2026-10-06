@@ -12,11 +12,13 @@ Read [design-sync-offset.md](design-sync-offset.md) first for what a sync offset
 ```text
 align_videos.py        asks for a reading per video, applies what comes back
       │
-      ├── utils/sync_align.py      AlignMeasure: a thread, so the window lives
+      ├── utils/sync_align.py      AlignMeasure: a thread per recording, so the
+      │                            window lives, and progress as each arrives
       │
       ├── vlc_player/audio_probe.py   VLC → a wav file on disk
       │
-      └── utils/sync_audio.py      pure DSP: samples in, a lag out
+      └── utils/sync_audio.py      pure DSP: samples in, a lag out, at one of
+                                   two scales (see *Two passes* below)
 ```
 
 The split matters: `sync_audio.py` touches neither VLC nor Qt, so everything it
@@ -28,6 +30,48 @@ part that needs VLC.
 `Verdict` per video, and any `Conflict` between the pairs. Nothing it decides is
 a matter of taste, so the tests for it need no player at all: the pairs are
 handed to it ready-made (see `TestSeveralReadingsAtOnce`).
+
+## Two passes, at two scales
+
+A grid of recordings of one event is usually minutes out before anything has
+been done about it, and a snippet read either side of the moment cannot see any
+part of that: two sixty-second readings five minutes apart share nothing at all,
+and no search over them can answer. So **Align By Sound** reads every file
+twice, and acts on the first reading before taking the second.
+
+| Pass | Reads | Compares | Finds |
+| --- | --- | --- | --- |
+| wide | minutes of every recording, at a block a second | the whole range, ±10 minutes | the lag to about a second |
+| close | a 60 s snippet of every recording, at 2 ms a block | ±30 s | the lag to 2 ms |
+
+Both readings are taken **around the video's own position**, and a reading is
+placed on the shared clock by the offset that video holds
+(`Sound.start_ms = origin_ms − offset_ms`). That is what makes the two windows
+overlap at all: in Sync Offset mode every seek carries the other videos to the
+same moment of the clock the offsets describe, so all the readings begin at the
+same place on that clock however far apart the recordings actually are. A
+misalignment of `e` therefore lands inside a window of half-width `H` as long as
+`|e| ≤ H`, which is what `COARSE_MAX_LAG_SEC` and `WIDE_READ_MS` are for.
+
+**The two passes cost one decode between them.** A wide reading is a stretch of
+a recording read from its start up to `position + H`, which is exactly what the
+close reading then wants a snippet of -- around the position the wide pass has
+just moved the video to, which can be a whole range further in. `SnippetCache`
+keeps what was decoded and the close reading is taken out of it, so the second
+pass costs a reading and no decoding at all: see
+`test_the_snippet_the_close_pass_reads_costs_no_second_decode`.
+
+Everything the search does that depends on how long a block is lives in one
+`Scale` (`sync_audio.scale`), and `best_lag`, `measure_pairs` and `align` take
+one: `FINE_SCALE` is the two-millisecond one described below, and
+`COARSE_SCALE` is the block-a-second one. Measured over 64 synthetic pairs of
+one event an hour long, shifted by 0, ±5, ±61, ±300, ±450 and ±599 seconds, the
+coarse search put the close pass on the right place 64 times out of 64, and
+never acted on a wrong answer. Where it did settle on the wrong place at all it
+did so at a score of 0.02 to 0.11 -- a wrong peak scores near nothing over the
+whole of a long overlap -- so the answer is thrown away rather than acted on.
+That is the property worth having: a wrong answer that scores like a right one
+would move videos by minutes on no evidence.
 
 ## Three decisions that are not obvious
 
@@ -58,6 +102,12 @@ the error is zero by construction. It costs the time to decode everything before
 the window, which runs at roughly **300× the length of the audio** (40 s of
 audio through VLC in 0.12–0.14 s, `acodec=s16le`, 8 kHz mono), so an hour-long
 recording read to the half-hour mark takes about 6 seconds.
+
+The wide reading is the same rule at a larger size -- from the start of the
+recording to `position + H` -- and it is the same decode the close pass then
+reads its snippet out of. Seeking would be cheaper by a wide margin and is not
+done for the same reason: a second of origin error is nothing to a search over
+minutes of sound and everything to one that places a lag to the millisecond.
 
 ### 2. What gets compared is the shape of the sound, not its loudness
 
@@ -131,7 +181,7 @@ o_i' = o_ref + δ_i                            # the offset that makes the recor
 ## The search
 
 `best_lag()` looks for the lag in two passes, because the range worth searching
-(±12 s at 2 ms a block is 24000 positions × 15000 blocks) is nothing like the
+(±30 s at 2 ms a block is 30000 positions × 30000 blocks) is nothing like the
 fineness worth having.
 
 | Pass | Compares | Finds |
@@ -183,27 +233,64 @@ where that average is taken over a shorter window than anywhere else. Both are
 synthetic fixtures, not real recordings; the claim `MIN_SCORE` rests on (0.341
 for loudness, 0.667 for shape) is from real ones.
 
+**A middling score means something of its own.** Two recordings of one event
+score at or near the top of the range; two unrelated ones score near nothing.
+In between -- the 0.5 to 0.7 a pair of *partly* related recordings comes to --
+is the case where they agree over part of what they share and not the rest, and
+there is a common way for that to happen: **one of them holds something the
+other does not**. A recording with a minute of something added in the middle
+does not differ from the original by any one offset at all -- before the
+addition they are together, after it they are a minute apart -- so at the lag
+that lines the first half up the second half is a minute out, and the score over
+the whole overlap is pulled towards the middle. Measured on two such files: the
+wide pass came to 0.58 where a pair of recordings of one event comes to 1.00.
+
+That is not a wrong answer so much as an answer to a different question, and it
+is why the dialog reads the sound **around the moment the videos are on**: what
+it can line up is the part of the pair the viewer is looking at, and a minute of
+snippet either side of that moment is what says which part that is. Paused in
+the shared half, the close pass finds them lined up to the millisecond (1.00);
+paused in the half that was added to, it finds the section's worth of lag
+instead and lines *that* half up (measured on the two files above: a section of
+30 s, found at 30 s, score 1.00). One number per recording cannot describe the
+pair, so what comes of this is that the half being watched is right and the
+other half is a section out -- and the middling score the wide pass reported is
+the honest sign of it.
+
 ## Constants
 
-All in `utils/sync_audio.py` unless noted.
+The fine scale's numbers are in `utils/sync_audio.py`, and most of them are in
+`FINE_SCALE` (a `Scale` holds everything the search needs that depends on how
+long a block is). The coarse scale's are in `COARSE_SCALE`, beside it.
 
 | Name | Value | Why |
 | --- | --- | --- |
 | `SAMPLE_RATE` | 8000 | enough to see a clap by, and cheap in pure Python |
-| `BLOCKS_PER_SEC` | 500 (2 ms) | a twentieth of a second is heard as two of the same sound |
-| `MIN_OVERLAP_SEC` | 1.0 | less than this and one loud block decides the answer |
-| `MAX_LAG_SEC` | 12.0 | the range that makes this worth doing at all |
-| `COARSE_DECIMATION` | 20 | see above — shallow on purpose |
+| `FINE_SCALE.blocks_per_sec` (`BLOCKS_PER_SEC`) | 500 (2 ms) | a twentieth of a second is heard as two of the same sound |
+| `FINE_SCALE.min_overlap_sec` (`MIN_OVERLAP_SEC`) | 1.0 | less than this and one loud block decides the answer |
+| `FINE_SCALE.max_lag_sec` (`MAX_LAG_SEC`) | 30.0 | half a snippet: as far as one reading can move against the other and still have half of them to compare |
+| `FINE_SCALE.shape_span_sec` (`SHAPE_SPAN_SEC`) | 0.5 | the swell taken out before comparing |
+| `FINE_SCALE.peak_separation_sec` (`PEAK_SEPARATION_SEC`) | 1.0 | a rival nearer than this is the shoulder of the answer |
+| `FINE_SCALE.fine_span_sec` (`FINE_SPAN_SEC`) | 4.0 | enough to place a sound, short enough to stay quick |
+| `FINE_SCALE.fine_reach_sec` (`FINE_REACH_SEC`) | 0.12 | ±120 ms, three coarse blocks either way |
+| `FINE_SCALE.coarse_decimation` (`COARSE_DECIMATION`) | 20 | see above — shallow on purpose |
+| `FINE_SCALE.conflict_ms` (`CONFLICT_MS`) | 300 | how far two pairs may disagree about one recording; above the encoder, far below a wrong peak |
+| `MIN_SCORE` / `FINE_SCALE.min_score` | 0.3 | on shaped sound; unrelated sound scores near zero |
+| `MIN_PROMINENCE` / `FINE_SCALE.min_prominence` | 0.25 | a quarter above the best distant rival, or the answer is not acted on |
 | `RIVAL_CANDIDATES` | 8 | how many of the rough search's other favourites are measured again at full resolution |
-| `FINE_REACH_BLOCKS` | 60 | ±120 ms, three coarse blocks either way |
-| `FINE_SPAN_BLOCKS` | 2000 (4 s) | enough to place a sound, short enough to stay quick |
-| `SHAPE_SPAN_SEC` | 0.5 | the swell taken out before comparing |
-| `MIN_SCORE` | 0.3 | on shaped sound; unrelated sound scores near zero |
-| `MIN_PROMINENCE` | 0.25 | a quarter above the best distant rival, or the answer is not acted on |
-| `PEAK_SEPARATION_SEC` | 1.0 | a rival nearer than this is the shoulder of the answer |
-| `CONFLICT_MS` | 300 | how far two pairs may disagree about one recording; above the encoder, far below a wrong peak |
+| `COARSE_SCALE.blocks_per_sec` | 1 (1 s) | as coarse as a search over minutes can be and still place anything |
+| `COARSE_SCALE.max_lag_sec` (`COARSE_MAX_LAG_SEC`) | 600.0 | ten minutes either way: what a grid of one event is usually out by |
+| `COARSE_SCALE.min_overlap_sec` | 60.0 | an hour is being compared; a second of it either side of a match is nothing |
+| `COARSE_SCALE.shape_span_sec` | 10.0 | the same swell at this size |
+| `COARSE_SCALE.peak_separation_sec` | 30.0 | half a minute apart is two peaks at a block a second |
+| `COARSE_SCALE.fine_span_sec` | 1200.0 | what the close look compares at this size |
+| `COARSE_SCALE.fine_reach_sec` | 60.0 | how far from the rough answer the close look goes |
+| `COARSE_SCALE.coarse_decimation` | 5 | **not** the fine scale's twenty: see *Two passes* and the note on `COARSE_SCALE` |
+| `COARSE_SCALE.conflict_ms` | 5000 | the encoder is a block or two at this size; a pair out by more has settled on another peak |
+| `FINE_SNIPPET_MS` | 60000 | what the close pass reads, and so what its range is half of: a section added to a recording is lined up on either side of the addition, not only on the side the wide pass settled on |
+| `WIDE_READ_MS` | 1 265 000 | the coarse range either side of the moment, plus the snippet, so one decode answers both passes |
+| `MAX_BLOCK_SAMPLES` | 2000 | how many samples of a block are measured where a block is seconds long |
 | `KEPT_RECORDINGS` | 3 | stretches kept between readings; one per recording is all that is wanted |
-| `SNIPPET_MS` (`audio_probe.py`) | 30000 | caps the range: two windows must still overlap |
 
 ## Why there is no numpy
 
@@ -216,10 +303,20 @@ coarse-to-fine rather than a full-resolution search or an FFT.
 
 | Step | Cost |
 | --- | --- |
-| reading one video, first time | ~position ÷ 300, i.e. ~6 s per hour of position |
+| reading one video, first time | ~(position + range) ÷ 300, i.e. ~6 s per hour of position, plus ~2 s for the ten minutes either way |
 | reading one video, after that | reading the snippet out of a wav: milliseconds |
-| correlation, per pair | ~0.3 s |
+| correlation, per pair | ~0.7 s at the fine scale, ~0.03 s at the coarse one |
+| envelopes | ~0.9 s for a quarter of an hour at 2 ms blocks, ~0.1 s at a block a second (`MAX_BLOCK_SAMPLES`) |
 | disk, per recording | position × 16 KB/s, held for the process (`SnippetCache`) |
+
+**Readings run one to a recording at a time.** `AlignMeasure` starts a thread per
+recording, so a grid of three pays for the slowest of them rather than for all
+three -- which is what makes reading minutes of a five-hour recording bearable at
+all. `SnippetCache` gives each recording a lock of its own for the whole of a
+reading of it: readings of different recordings go on at once, and two readings
+of one recording are kept to one decode. What is kept is reached by several
+threads at a time, so the locks around it are held for no longer than the look at
+what is there; the decoding itself happens outside them.
 
 The reading is the dominant cost and grows with how far into the recording the
 moment is, so what was read is kept: `SnippetCache` holds, per recording, the
@@ -227,9 +324,35 @@ sound from its start up to the deepest moment read so far, and answers every
 earlier request out of it. Lining up by sound is read-correct-look-read again,
 and the videos move between one reading and the next, so the second press of
 **Align By Sound** wants a different moment of the same recordings — which the
-stretch already read covers. A recording whose file changed (`file_key`: path,
-mtime, size) is read again, at most `KEPT_RECORDINGS` are held, and the files
-live in a temporary directory removed when the process ends.
+stretch already read covers. The wide pass is what makes the stretch deep, and
+the close pass is what reads the snippet out of it. A recording whose file
+changed (`file_key`: path, mtime, size) is read again, at most
+`KEPT_RECORDINGS` are held, and the files live in a temporary directory removed
+when the process ends.
+
+## What the dialog draws of it
+
+`widgets/sync_strip.py`. The readings are what the strips are for, and there are
+two kinds of them:
+
+* **One strip above everything else**, with every video's sound drawn over every
+  other's, each in its own colour and through itself, and the video being worked
+  on drawn last and a little more solidly. This is the only place two recordings
+  are seen against each other, and it is where an offset that is a little out is
+  seen to be a little out.
+* **One strip under each row**, drawing that video's own sound and nothing else.
+  A row carrying another recording's shape as well would be two things to read at
+  once in the room for one, and what the other recordings are doing is the
+  overview's to say.
+
+They share one window -- the dialog owns it and hands it to all of them -- and
+one zero: the moment the readings were taken around, which is where the videos
+were when their sound was read and stays put while the offsets are tuned under
+it. A drag along the row of the video being worked on moves that video's sound
+and nothing else; along any other row it moves the window, which is what looking
+further along is. Double-clicking a strip is what gives that video's sound its
+colour, which is kept against the file rather than the playlist
+(`models/spectrum_colors.py`).
 
 ## Testing this
 
@@ -273,5 +396,67 @@ Two end-to-end properties are worth keeping pinned, because both were bugs:
 * `Align By Sound` seeks the videos afterwards, not merely the offsets.
 
 A third was found by the tests above and is worth keeping pinned as well:
-readings are not always the same length, and the overlap at a lag is worked out
-from the reference's length rather than the other's.
+readings are not always the same length, and the overlap at a lag is bounded by
+**both** of them — the reference's length, and what is left of the other past
+the lag. What it is not is the reference's length less the lag: that is the same
+number while the two readings are of one length, which is what a snippet against
+a snippet is, and the wide pass's readings are never of one length (the shorter
+recording gives the shorter reading). See the trap below.
+
+A fourth is the whole two-pass feature, and it is pinned end to end rather than
+in pieces: `TestTwoRecordingsThatBeganAMinuteApart` writes two files that are
+cuts of one event a minute apart, reads them the way the dialog does -- wide
+first, then a snippet out of what the wide read already decoded -- and asserts
+that the minute comes back exactly and that the close pass then has nothing left
+to move. A minute is what the fine scale cannot see any part of, so a regression
+that broke the wide pass or the reading of the snippet out of it would show up
+here and nowhere else.
+
+Two more traps came out of this work, both of them in the search rather than in
+the fixtures:
+
+* **Pooling twenty blocks at the coarse scale is too much.** Twenty blocks at a
+  block a second is twenty seconds of sound averaged into one, which flattens a
+  stretch of short sounds into nearly one value, and the rough pass then guides
+  the close one from a peak nowhere near the answer. At the fine scale twenty
+  blocks is forty milliseconds and pooling that much is the right thing; the
+  scales do not share the number. Measured over the 64 pairs above: pooled
+  twenty, 60 of them were placed rightly and 4 were thrown away; pooled five,
+  64 and none.
+* **A close look whose window cannot move does not look at negative lags.**
+  `_fine_lag` compares a stretch of what the two readings share at that lag. It
+  used to take a window from the middle of one reading and look for it in the
+  other, which can only be done where the window *fits* -- and a reading barely
+  longer than the window (the wide pass's shape: minutes of a recording against
+  a window of minutes) has nowhere to put it but where it already is, so every
+  negative lag was skipped and the answer came back as no lag at all. Four
+  seconds of a snippet against a snippet has all the room in the world, which is
+  why the fine scale never showed it.
+
+A third came out of the same work, and it is the one that cost a user their
+pairs of short files:
+
+* **The overlap at a lag is bounded by both readings, not by the reference's
+  length less the lag.** `_overlap` used to work the share out as
+  `reference[:len(reference) - lag]` against `other[lag:]`, which is exactly
+  right while the two readings are the same length -- and the fine pass's
+  always are, both being the snippet that was asked for. A wide reading is not:
+  two minutes of a recording against the same two minutes with something added
+  in front gives 119 blocks against 219. At the lag that lines them up (100 s)
+  the old sum leaves 19 blocks of a 120-second recording, below the minute of
+  shared sound a lag is believed on, so **every lag past about
+  `min_overlap_sec` was left unevaluated** and both passes came back saying
+  nothing was alike. Measured on those files, with the fix and without:
+
+  | Inserted at the front | Before | After |
+  | --- | --- | --- |
+  | 40 s | found, 1.00 | found, 1.00 |
+  | 60 s | found a second out, 0.47 (the last second was rescued by the close pass) | found, 1.00 |
+  | 80 s | **thrown away, 0.28** | found, 1.00 |
+  | 100 s | **thrown away, 0.29** | found, 1.00 |
+
+  `TestReadingsOfDifferentLengths` now pins all four. The lesson is the general
+  one: a bound that is right for one size of reading is not right for the other,
+  and the two scales read the same two files at sizes that differ by three
+  orders of magnitude.
+

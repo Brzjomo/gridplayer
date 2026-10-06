@@ -31,6 +31,7 @@ information about the position, sound volume, loops, aspect ratio, etc.
 - Set loop fragments with frame percision
 - Configurable grid layout
 - Easy swap videos with drag-n-drop
+- Line up recordings that started at different times by comparing their sound
 - Playlist retains settings for each video
 
 ## Translation
@@ -270,6 +271,32 @@ Installing an engine the ordinary way is normally all it takes. Two cases need a
 
 Not every link needs one. YouTube often hands out addresses that need no unscrambling at all, and nothing
 else GridPlayer plays uses this. It's worth installing when YouTube specifically starts failing.
+
+## Lining recordings up (multi-camera sync)
+
+Recordings of one event usually start at different times, so playing them side by side means telling
+GridPlayer where each timeline sits against the others'. Right-click a video, open **Sync Offset** and
+choose **Align Videos…**:
+
+1. Press **Align By Sound**. It reads the sound of every file and lines them up on whichever recording the
+   others agree with, to within a few milliseconds. The offsets are saved with the playlist, so the videos
+   stay lined up through every seek and the next time you open it.
+2. What is still out is moved by hand: tick **Working on** against a video and drag its own strip — that
+   video's picture goes where its sound was dragged to, and no other row moves. **Read Sound** reads and
+   draws the sound without moving anything, and the − and + beside a row nudge it by whatever **Move by**
+   is set to. Double-click a strip to give that recording a colour of its own.
+
+What it can and cannot do:
+
+- It looks **ten minutes either side** of where the videos are on screen, and wants about a minute of sound
+  the recordings have in common. Further out than that, bring them closer by hand first.
+- A set that **mixes codecs** (say one PCM file and one AAC) is left about a tenth of a second out. Files
+  from the same devices cancel that out.
+- A recording that holds something the others do not — a section added or cut out — is lined up on the side
+  you are looking at, and the other side stays out by the length of what was added: no single offset can
+  describe that pair. Pause somewhere both recordings cover to line up that part.
+- Videos are lined up as they play, not corrected while they play: if a long pair drifts apart over hours,
+  seek once and they are back together.
 
 ## Known issues
 

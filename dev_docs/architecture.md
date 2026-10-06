@@ -204,22 +204,29 @@ no Qt and no VLC in its middle, and is documented properly in
 
 | File | Role |
 | --- | --- |
-| `dialogs/align_videos.py` | The dialog: a row per video, and **Align By Sound**. Asks for a reading per video and applies what comes back. |
-| `widgets/sync_strip.py` | The sound of one video drawn over the reference's, against the clock the records are meant to share: the eye's fallback where the numbers are not to be trusted. |
-| `utils/sync_align.py` | `AlignMeasure`: reading every video's sound on a `QThread`, one signal with all the readings at the end. |
+| `dialogs/align_videos.py` | The dialog: a row per video, the sound of every one of them over every other's, and **Align By Sound**. Asks for a reading per video three ways -- minutes of each at a block a second, then a snippet out of what was read at two milliseconds, or that snippet on its own for **Read Sound**, which draws the sound and moves nothing -- and applies what comes back. It also carries the **Sync Offset** tick, since the menu that owns the mode is behind the dialog. |
+| `widgets/sync_strip.py` | Two kinds of strip: one above everything with every video's sound drawn over every other's in its own colour, and one under each row with only that row's sound. The eye's fallback where the numbers are not to be trusted, and where a sound is dragged to move its video. |
+| `utils/sync_align.py` | `AlignMeasure`: reading every video's sound, one `QThread` a recording, a `progress` signal as each arrives and one `measured` signal with all of them. |
+| `models/spectrum_colors.py` | The colour each recording's sound is drawn in, kept in the settings against the path of the file. The only part of this that outlives the dialog without being an offset. |
 | `vlc_player/audio_probe.py` | A player of its own, with no window and a dummy audio output, transcoding a stretch of a recording into a wav file. `AudioProbe.envelope()` is the only thing here that needs VLC. |
-| `utils/sync_audio.py` | All of the arithmetic: samples in, a lag out, plus the cache of stretches already read (`SnippetCache`), the wav reading, and `Sound` (a reading placed by an offset). Touches neither VLC nor Qt, which is why most of its tests need no player. |
+| `utils/sync_audio.py` | All of the arithmetic: samples in, a lag out at one of two scales (`Scale`), plus the cache of stretches already read (`SnippetCache`), the wav reading, and `Sound` (a reading placed by an offset). Touches neither VLC nor Qt, which is why most of its tests need no player. |
 
 Nothing here shares a player with the grid. A player given audio callbacks has no
 output left to give the sound to, so analysing what is being played would take
 the sound away from the viewer; a second player, with `--aout=dummy`, does not.
+
+Readings of different recordings run at once -- one thread each, so a grid of
+three pays for the slowest of them rather than for all three -- and what they
+share is `SnippetCache`, which gives each recording a lock of its own so that two
+readings of one recording cost one decode. See
+[audio-alignment.md](audio-alignment.md).
 
 ## Threading model
 
 | Thread | What runs there |
 | --- | --- |
 | Qt main thread | All widgets, all managers, all dialog interaction, VLC event handling for in-process players. |
-| Worker `QThread`s | URL resolution (`utils/url_resolve/url_resolve.py`), network checkups, thumbnail/screenshot work, and reading a video's sound for the alignment dialog (`utils/sync_align.py`). They hand results back by signal. |
+| Worker `QThread`s | URL resolution (`utils/url_resolve/url_resolve.py`), network checkups, thumbnail/screenshot work, and reading a video's sound for the alignment dialog (`utils/sync_align.py`, one thread per recording). They hand results back by signal. |
 | `single_instance.Listener` thread | A daemon thread accepting connections on the instance socket; emits `open_files` into the main thread. |
 | Child **processes** | The default decoder mode. One process per `VideoFrameVLC*`, each running its own `vlc_player.Player`; the main process talks to them over stdio. |
 | `stream_proxy` server thread | The local HTTP server, when the proxy is active. |

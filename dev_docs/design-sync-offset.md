@@ -1,9 +1,17 @@
 # 设计方案：同步偏移对齐（Sync Offset）
 
-> 状态：**P1 已实现**（见 §11）。P3 及以后尚未开工。
+> 状态：**已交付**。P1（同步点与偏移）、P3（对齐对话框）、P4/P5（音频包络与自动
+> 对齐）、P8（±10 分钟自动范围 + 界面按"用手操作"重做）都已实现；P2（播放期持续
+> 校正）决定不做，P6（视觉胶片条）已否决，P7（两点对齐）未开工。阶段表见 §11。
+>
+> 各节的现状：§2 语义、§3.1 字段、§5 越界提示、§6 UI、§7/§8 的**做法**都已按实际
+> 实现改写；§4 是决定不做的部分，开头有说明。**声音处理本身的细节**（两级搜索、
+> 常量、代价、陷阱）在 [audio-alignment.md](audio-alignment.md)，那才是那份东西的
+> 现状文档；本文件的 §11 保留各阶段的原始设计与实施差异，是取舍的记录。
+>
 > 分支：`feat/sync-offset`
 > 目标场景：同一事件的多机位/多路录像，各自起始时间与时长不同，需要严格对齐后同步观看。
-> 已定的取舍（见 §13）：不做持续校正；旧同步模式保留在菜单里；内部存毫秒、UI 另显示帧数；辅助手段优先做音频。
+> 已定的取舍（见 §14）：不做持续校正；旧同步模式保留在菜单里；内部存毫秒、UI 另显示帧数；辅助手段只做音频。
 
 ## 1. 问题
 
@@ -42,7 +50,9 @@ t_i = t_master + (offset_i - offset_master)        # 记 delta_i = offset_i - of
 
 **为什么存绝对值而不是存 delta。** delta 依赖 master 的选择，换 master 就要重算全部数值，且存进播放列表后语义会随"哪个是 master"漂移。存绝对值则每个视频自洽，master 只是显示用的参照系，可以随时切换而不改数据。
 
-**方向的措辞需要你确认**（见 §13 问题 1）。上面 `delta_i > 0` 表示"视频 i 必须比 master 播得更靠后（seek 更远）"。UI 上我会写成"偏移 +00:01:10.000（靠后）"以避免歧义。
+**方向的措辞**：定为不用 `delta` 这个词（见 §14 问题 1），菜单/界面说的是"同步点"
+（`Sync point`）本身的前后。上面 `delta_i > 0` 表示"视频 i 必须比 master 播得更靠后
+（seek 更远）"。
 
 ## 3. 数据模型与持久化
 
@@ -71,19 +81,33 @@ sync_offset_ms: int | None = None
 
 ### 3.3 新增设置
 
-`settings.py` 的 `_default_settings`：
+原设计为 P2 的持续校正准备过三个设置（`sync_offset_enforce`、
+`sync_offset_drift_frames`、`sync_offset_reference`）。**P2 不做，这三个都没有
+实现**（见 §4、§14 问题 3），对齐是"暂停时完成、播放时保持"，没有需要调的东西。
 
-```python
-"playlist/sync_offset_enforce": True,        # 播放期间持续校正
-"playlist/sync_offset_drift_frames": 2,      # 漂移超过该帧数才重新 seek
-"playlist/sync_offset_reference": "",        # 参考视频的 block id，空 = 第一格
-```
+这个功能实际新增的设置只有两个，都由对齐对话框自己写（不在设置表单里，见
+[settings-system.md](settings-system.md) 的 "Settings with no row in the form"）：
 
-并在 `params/defaults_fields.py` 的 `PLAYLIST_FIELDS` 加对应行（放进 "Playback" 段），`params/menu.py` 的 `Playlist Settings` 子菜单加菜单项。注意 `AGENTS.md` 的翻译上下文规则：同一开关在菜单和设置表单都出现时用**设置名作上下文**。
+| 键 | 谁写 | 形态 |
+| --- | --- | --- |
+| `playlist/spectrum_colors` | 双击频谱条选颜色时 | `SpectrumColors`（pydantic）：文件路径 → `#rrggbb`，上限 `KEPT_COLORS` |
+| `playlist/sync_nudge_step` | `Move by` 下拉 | 该对话框步长元组的下标，读的时候钳进范围 |
 
-## 4. 播放期强制执行
+两个都是 `Settings` 而不是 `PlaylistSettings`：颜色属于文件，不属于它被看见时所在的
+播放列表；步长是对话框的偏好。**不进 .gpls**。
 
-这是与现有 `sync` 的本质区别：现有逻辑只在 seek 时触发一次，本功能需要**持续成立**。
+## 4. 播放期强制执行　【决定不做】
+
+> **结论：不做**（用户定的："暂停对齐好再播放即可"）。因此本节从 §4.1 往下都是
+> 当时的设想，代码里**没有**漂移检测、阈值重对齐，也没有相关设置。
+>
+> 代价与替代：
+>
+> * 长时间播放会缓慢漂移（各机位晶振不同），**重新 seek 一次即复位**——因为每一次
+>   seek 都会按偏移把其他视频带到同一时刻；
+> * 播放/暂停状态是镜像的，并且**开始播放前先按偏移重新对齐一次**（见 §11 里
+>   "P1 之后补上的一项"）：每次播放都从对齐状态起步，不需要播放中纠偏，也就没有
+>   抖动风险。
 
 ### 4.1 两个触发源
 
@@ -108,17 +132,20 @@ if abs(drift_i) > threshold_i:  seek_i(expected_i)
 
 ### 4.3 与现有 seek-sync 的关系
 
-建议**新增** `SeekSyncMode.OFFSET`，而不是改 PERCENT/TIMECODE 的语义：
+**做的是新增** `SeekSyncMode.OFFSET`，而不是改 PERCENT/TIMECODE 的语义（现在的枚举
+就是这四项，`params/static.py`）：
 
 ```python
 class SeekSyncMode(AutoName):
     DISABLED = auto()
     PERCENT = auto()
     TIMECODE = auto()
-    OFFSET = auto()      # 新增
+    OFFSET = auto()      # 本功能新增
 ```
 
-这样旧播放列表里的 `seek_sync_mode` 值仍然可读、行为不变。是否**移除**旧的两项见 §13 问题 2。注意新增枚举值要同步 `_seek_sync_modes()`（`defaults_fields.py:91`）和 settings 的迁移逻辑——按 `settings.py:198` 的惯例，如果语义变了要加迁移。
+这样旧播放列表里的 `seek_sync_mode` 值仍然可读、行为不变；旧的两项**保留**，不移除
+（见 §14 问题 2）。枚举值同步进了 `_seek_sync_modes()`（`defaults_fields.py`），
+因为"加一个枚举值而不改语义"，所以没有加迁移。
 
 ## 5. 越界提示
 
@@ -126,16 +153,22 @@ class SeekSyncMode(AutoName):
 
 | 情况 | 行为 |
 | --- | --- |
-| `t_i < 0` | 位置钳到 `0`，**暂停**该视频，格内显示"视频尚未开始" + 差值 |
+| `t_i < 0` | 位置钳到 `0`，**暂停**该视频，格内显示"录像要 … 后才有画面" + 差值 |
 | `0 ≤ t_i < length_i` | 正常播放/定位；若此前越界则恢复播放 |
-| `t_i ≥ length_i` | 钳到末尾，暂停，显示"视频已结束" + 超出量 |
+| `t_i ≥ length_i` | 钳到末尾，暂停，显示"录像已经结束 …" + 超出量 |
 
-用户原文要求显示"超出视频范围"以及"超出多少时间"。建议**区分"尚未开始"与"已经结束"**——两者对使用者的含义完全不同（前者等一会儿就有画面，后者永远不会有了）。两个文案都附上超出量：
+用户原文要求显示"超出视频范围"以及"超出多少时间"。**实现时区分了"尚未开始"与
+"已经结束"**——两者对使用者的含义完全不同（前者等一会儿就有画面，后者永远不会有了）。
+两个文案都附上超出量与帧数（`sync_out_of_range_txt` / `sync_gap_txt`，上下文
+`Video Status`）：
 
 ```text
-视频尚未开始（差 00:00:05.000 · 125 帧 @25fps）
-视频已结束（超出 00:00:12.300）
+超出视频范围 — 录像要 00:00:05.000 (125f) 后才有画面
+超出视频范围 — 录像已经结束 00:00:12.300 (308f)
 ```
+
+（英文原文：`Out of video range — recording starts {SHORT_BY} later` /
+`… recording ended {SHORT_BY} earlier`。）
 
 实现落在**状态显示层**。`widgets/video_status.py` 已有 `VideoStatus`（loading/info 两种子状态），`VideoBlock.update_status(info_text, percent)` 已经存在，因此可以复用状态机制而不是新造浮层——新增一个"越界"状态类型，带标题 + 副标题（差值）。需注意 `_paint_stopped_chrome` 与 overlay 的 `is_overlay_fits` 逻辑，别让提示被 overlay 遮住。
 
@@ -143,118 +176,136 @@ class SeekSyncMode(AutoName):
 
 ### 6.1 快捷操作（右键菜单）
 
-挂在现有 `Seek Sync` 子菜单（`params/menu.py` 的 `SECTIONS["playlist"]`）下，或新建一个 `Alignment` 子菜单。动作（均在 `params/actions.py`，通过 `("active", ...)` 路由）：
+实测后的样子：**`Sync Offset` 子菜单**（`params/menu.py`，视频右键菜单里，
+`Seek Others` 之后），加一个 `Seek Sync` 子菜单里的模式项。动作都经
+`("active", …)` 路由到当前格子：
 
-| 动作 | 命令 | 说明 |
-| --- | --- | --- |
-| 以当前位置为同步点 | `set_sync_point_here` | `offset = 当前位置`。**这是主流程**——人眼/人耳对齐后一键登记 |
-| 偏移 +1 帧 / −1 帧 | `offset_nudge_frames(±1)` | 用该视频自身 fps |
-| 偏移 +10 帧 / −10 帧 | `offset_nudge_frames(±10)` | |
-| 偏移 +1 秒 / −1 秒 | `offset_nudge_ms(±1000)` | |
-| 清除偏移 | `reset_sync_offset` | |
-| 偏移：%v | 只读显示 | `value_getter` → `get_sync_offset_txt()` |
-| 对齐所有视频 | `align_videos` | 打开对齐对话框 |
+| 菜单项 | 动作 id | 命令 | 说明 |
+| --- | --- | --- | --- |
+| `Offset: %v` | `Sync Offset: %v` | `("active", "sync_offset_dialog")` | 只读显示当前偏移，**点它弹出输入框**（`-0:05.000` 这种写法）；`value_getter` → `get_sync_offset_txt` |
+| `Set Sync Point Here` | `Set Sync Point Here` | `("active", "set_sync_point_here")` | `offset = 当前位置`。人眼/人耳对齐后一键登记 |
+| `Forward / Back By One Frame` | `Shift Sync Point Forward/Back By One Frame` | `sync_offset_shift_frames(±1)` | 用该视频自身 fps；fps 未知时 `enable_if: is_active_offset_in_frames` 灰显 |
+| `Forward / Back By One Second` | `Shift Sync Point Forward/Back By One Second` | `sync_offset_shift_ms(±1000)` | |
+| `Offset Reset` | `Sync Offset Reset` | `("active", "sync_offset_reset")` | 回到"没有偏移" |
+| `Align Videos…` | `Align Videos…` | `align_videos` | 打开对齐对话框（`show_if: is_more_than_one_video`） |
+| `Sync Offset`（模式） | `Seek Sync (Offset)` | `set_seek_sync_mode(OFFSET)` | 打勾表示当前处于该模式；`Disabled` / `Percent` / `Timecode` 三项照旧 |
 
-`enable_if` 需要新的判定命令（参考 `active_block.py` 的 `is_active_*` 惯例），例如 `is_active_offset_settable`（需要已初始化 + 有 fps 信息）。
+微调**没有绑定快捷键**：动作表里这些项都没有 `key`（原设计里的
+`Shift+Alt+←/→` 未实现，见 §6.3）。`show_if` 用 `is_active_seekable`，
+即"当前格子有可 seek 的媒体"；越界时位置会被钳住并给出提示（见 §5）。
 
 ### 6.2 对齐对话框（`dialogs/align_videos.py`）
 
-这是功能真正好用的地方。一行一个视频，行内两段：一行是数字和按钮，下一行是**包络条**。
+一行一个视频，行内两段：上面一行是数字和按钮，下面一行是**包络条**。顶部是编号
+步骤的提示（六步，见下），再往下是**总频谱**（所有视频叠画），然后是表头、各行的
+两段、底部结果说明与按钮。
 
 | 列 | 内容 |
 | --- | --- |
-| Align to | 单选：**其他视频对齐到这一路**（全局只有一个，见 §11 第七个修正） |
-| 标题 | 文件名（截断） |
-| 当前位置 | `0:12.345` |
-| 同步点 | `+00:01:10.000 (+1875f)` |
-| 范围 | 空 / `starts in 0:05.000 (125f)` / `ended 0:12.000 (300f) ago` |
-| Sound match | `reference` / `0.67` / `0.21 (weak)` 等 |
-| 按钮 | `Set point`（登记当前位置）、`±10s ±1s`、`±10f ±1f`、`Reset` |
-| 包络条 | §11 第六、七个修正：横跨整行、**所有行共享一根有刻度的标尺** |
+| **Working on** | 单选（`QButtonGroup`，全局一个）：**现在动哪一路**。它只决定拖动改谁、以及"没有对齐过时"标尺的零点取自哪一路；判定用的基准由声音自己选（`_run_reference_id`） |
+| **Video** | 文件名 |
+| **Position** | `0:12.345` |
+| **Sync point** | `+00:01:10.000`（该路的偏移） |
+| **Range** | 空 / `starts in 0:05.000 (125f)` / `ended 0:12.000 (300f) ago`（越界，见 §5） |
+| **Sound match** | `reference` / `1.00` / `0.21 (weak)` / `0.48 (unsure)` / `0.9 (conflict)` / 空（没读过或没声音） |
+| **Move by** | 步长下拉：1 ms / 10 ms / 100 ms / 1000 ms / 10000 ms / 1 frame / 10 frames（`NUDGE_STEPS`，存在 `playlist/sync_nudge_step`） |
+| **moves** | `−`、`+`（按上面选定的步长动这一路）、`Reset`（清掉这一路的偏移） |
+| **包络条** | 每行只画这一路的声音（`SyncSoundStrip`），**所有行共享一根有刻度的标尺**；细线是这一路此刻的位置 |
 
-对话框底部：`Align By Sound`（读声音自动对齐）、`Align others to <名字>`（把所有其他
-视频带到这里选中的那一路的时刻）、`Fit`（把读取过的声音全部显示出来），以及一句
-说明这次读数判定的基准是谁。
+总频谱那条（`SyncOverviewStrip`）把每一路的声音**叠画**在一起，各用各的颜色，被
+选中的那一路最后画、更不透明：一眼看出哪几路已经重合。
 
-### 6.3 快捷键
+**手动路径全靠拖**（第八个修正去掉了 `Set point` 与 `Align others to …`）：
 
-偏移微调天然适合键盘：`Shift+Alt+←/→` 调当前视频 ±1 帧，配合 `[`/`]` 切换要调的格子。注意**必须检查冲突**——`utils/keymap.py` 的 `dedupe_keymap` 会静默丢弃重名绑定的后者，而当前没有全局冲突测试（见 `known-issues-and-risks.md`）。
+* 拖**被选中那一行**的条子 = 改这一路的偏移；松手才 seek 一次（拖动中每像素一次
+  seek 会打死 VLC）；画面跟着走到新位置；`Esc` 原样放回。
+* 拖**其他行**的条子 = 整扇窗口一起平移（看别处），滚轮缩放，`Fit` 显示全部。
 
-## 7. 音频包络 / 频谱辅助
+对话框底部：`Align By Sound`（读声音自动对齐）、`Read Sound`（只读当前位置周围
+60 秒并画出来，**不判定、不改偏移、不 seek**）、`Sync Offset` 勾选框（直接开关该
+模式，关掉时恢复打开前的模式）、以及右侧的 `Fit` 与 `Close`。结果说明会**分别交代
+两级各做了什么**（见 §11 第八个修正）。
 
-### 7.1 关键风险：amem 会夺走音频输出
+顶部的提示是六条编号步骤（`<ol>`，编号由控件生成），控件名用 `format` 从控件自己的
+标签取（`{ALIGN}`/`{READ}`/`{WORKING_ON}`/`{MOVE_BY}`/`{FIT}`），所以"提示里写的按钮
+名"和"按钮上写的"永远是同一个字符串。
 
-这一点必须写在最前面，因为它决定了整个架构：
+### 6.3 快捷键　【未实现】
+
+原设计建议 `Shift+Alt+←/→` 调当前视频 ±1 帧，配合 `[`/`]` 切换要调的格子。**动作表里
+这些项没有绑定 `key`**，所以现在没有快捷键；对话框里改的是"选步长 + 按 −/+"。
+若日后要加，注意 `utils/keymap.py` 的 `dedupe_keymap` 会静默丢弃重名绑定的后者，
+而套件里没有全局冲突测试（见 [known-issues-and-risks.md](known-issues-and-risks.md)）。
+
+## 7. 音频包络（现在的做法：转码成 wav）
+
+> **细节全部在 [audio-alignment.md](audio-alignment.md)**：两级搜索、全部常量与它们
+> 的实测依据、代价、并发、以及踩过的坑。这一节只记"为什么不是原设计的那套"。
+
+### 7.1 关键风险：amem 会夺走音频输出（因此没有走回调）
+
+这一点决定了整个架构，也决定了原设计被推翻：
 
 > `libvlc_audio_set_callbacks`（amem）安装回调后，VLC 不再把音频送给真实输出设备。
 
-也就是说，**如果直接在正在播放的 player 上装回调，用户就听不到声音了**。对播放器来说这是不可接受的。
+也就是说，**如果直接在正在播放的 player 上装回调，用户就听不到声音了**。对播放器来说
+这是不可接受的；而按原设计再开一个"分析 player"专门装回调，就要在解码进程里多养一套
+player、生命周期和实例复用都要照顾（原 §7.2 的 `audio_monitor.py` 方案）。
 
-因此音频分析必须走**独立的分析 player**：
+**实际做法**（见 §11 "P4/P5 的实现与设计的差异"）：不用回调，用一个独立实例的
+`MediaPlayer` **把一段声音转码成 wav 文件**（`--no-video`、sout 到 `transcode{acodec=s16l,channels=1,samplerate=8000}`），
+文件落在临时目录，读完之后纯 Python 从文件里算包络。好处是：
 
-- 在解码子进程里额外创建一个 `vlc.MediaPlayer`，用**独立实例选项**（`--no-video`、静音）创建，与真实播放器互不干扰；
-- 它自己 seek 到目标区间、自己解码、自己出包络，**不连接任何输出**；
-- 真实播放器完全不动，声音照常。
+* 播放器的音频输出完全不碰；
+* 转码在 VLC 自己的 C 代码里做（VLC 会替我们重采样），Python 只读 8 kHz 单声道，
+  读文件比在回调里算快得多，也不受回调线程的时序影响；
+* 时间戳来自文件本身（`Reading.origin_ms`），不需要在 flush 回调里重新锚定采样计数。
 
-由于 `ProcessManager._get_available_instance` 是按 **options 相等 + 人数未满** 复用实例的（`multiprocess/process_manager.py:168`），分析 player 选项一致，会自然聚到一个（或数个）分析实例上。但默认 `player/video_driver_players = 4` 会限制一个实例容纳的 player 数——9 格网格就需要多于 4 个分析 player。方案：给分析实例单独设一个更大的 `players_per_instance`（分析 player 很轻，只有音频解码）。
+### 7.2 只做包络，不做频带
 
-### 7.2 采集实现
+原设计考虑过"降采样后做少量频带 Goertzel"来画粗频谱。**没有实现**：对齐靠的是包络的
+形状（关门声、拍手、讲话起始这些**峰值**），频带没有提供额外的判据，而多一项就多一处
+调参。用户界面上的"频谱条"画的其实也是**包络**，只是画得密（2 毫秒一块），看上去像
+波形。
 
-新增 `gridplayer/vlc_player/audio_monitor.py`，结构对齐已有的 `image_decoder.py`（同一个作者、同一套 smem + 回调模式，可直接照抄骨架）：
+纯 Python 的算力预算因此更宽松：8 kHz、每块 2 毫秒，块内用
+`sum(map(mul, chunk, chunk))` 算能量；一秒的声音是 500 块，一分多钟的宽读数用抽稀
+（`MAX_BLOCK_SAMPLES`）压到可接受（实测一个 615k 块的读数：0.86 s vs 1.62 s）。不用
+numpy 仍然是硬约束（32 位 Windows 构建没有 numpy 轮子），这也是采样率取 8 kHz 的原因。
 
-```python
-class AudioMonitor:
-    def attach_media_player(self, media_player):
-        media_player.audio_set_format_callbacks(self.format_cb, self.cleanup_cb)
-        media_player.audio_set_callbacks(
-            self.play_cb, self.pause_cb, self.resume_cb, self.flush_cb, self.drain_cb, None
-        )
-```
+### 7.3 取数策略：按需片段，一次解码两用（已实现）
 
-- **format 回调里主动降规格**：请求 `S16N`、**单声道**、**8000 Hz**。VLC 会替我们重采样，之后纯 Python 的处理量下降一个数量级（48kHz 立体声 → 8kHz 单声道，数据量降到 1/12）。这是**为了绕开 numpy 而必须做的事**。
-- **play 回调**里对每个 block 算 RMS 包络（以及可选的频带能量），写入 `SafeSharedMemory`。
-- **flush 回调**里重置采样计数器——seek 之后必须重新锚定，否则时间戳全错。
-- **时间戳用采样计数**而不是 `get_time()`：`media_time = 起始时间 + 已交付采样数 / 采样率`。`get_time()` 在回调触发时本身有滞后，用它会把包络整体平移（各视频平移量还不一定相同）。采样计数是精确的。
-- 传输量很小（包络按 20ms 一块 ≈ 50 包/秒），走已有的命令通道（`cmd_send`）即可，不必像视频帧那样开共享内存。
+原设计在"按需片段"与"实时滚动"之间建议先做按需片段。**做的是按需片段**，并且比原设想
+更省：两级读数**共用一次解码**。
 
-### 7.3 纯 Python DSP 的可行性
-
-不用 numpy 的约束下，算力预算（单视频）：
-
-| 方案 | 每秒操作量 | 纯 Python 可行性 |
+| | 读什么 | 为什么 |
 | --- | --- | --- |
-| RMS 包络 @8kHz，20ms 块 | 8000 次乘加 | ✅ 轻松（约 5–10ms CPU/秒） |
-| 8 频带 Goertzel @8kHz，窗长 128 | 8×128×50 ≈ 51k | ✅ 可以（约 20–40ms CPU/秒） |
-| 全谱 FFT @48kHz 立体声 | — | ❌ 必须上 numpy，而 numpy 会打死 32 位构建 |
+| 粗读（wide） | 每路"自己位置 ±10 分钟"（`WIDE_READ_MS`），1 秒一块 | 差几分钟的错位，一段片段根本看不见 |
+| 细读（close） | 同一文件里"当前位置周围 60 秒"（`FINE_SNIPPET_MS`），2 毫秒一块 | 粗对齐已经把视频挪进这 10 分钟，所以这 60 秒一定在粗读已经解出的那段里 |
+| 只读（Read Sound） | 只有细读那 60 秒 | 只看频谱，不搜索 |
 
-结论：**降采样后做少量频带的 Goertzel**是可行的，能画出用户要的"频谱条"；全谱 FFT 不可行。好在对齐这件事，**包络的峰值（关门声、拍手、讲话起始）本身就是最好的锚点**，粗频谱主要是辅助确认。
-
-### 7.4 两种取数策略
-
-| 策略 | 优点 | 缺点 |
-| --- | --- | --- |
-| **按需片段**（推荐先做）：打开对话框时，对每个视频静默解码 `[T−5s, T+5s]` | 实现简单、CPU 只在需要时耗、无持续流式管道 | 移动位置后需要重新采样 |
-| **实时滚动**：分析 player 常驻，持续推包络 | 拖时间轴时同步更新，体验更好 | 管道、内存环形缓冲、生命周期都更复杂 |
-
-建议**先做按需片段**，验证对齐效果，再决定是否上实时滚动。
+`SnippetCache` 按录像记住"读到过的最深时刻"，同一录像的不同请求命中同一份 wav；不同
+录像各自加锁、可以并行读（各一个 `QThread`）。落在磁盘上的临时 wav 在进程退出时删除。
 
 ## 8. 自动对齐（互相关）
 
-如果 §7 已经能拿到包络，那么**自动算偏移几乎是免费的**，而且比人工看频谱更省事：
+原设计里的"10 秒窗口、20 毫秒一块、O(n²) 互相关几毫秒就好"只覆盖了现在的一小部分：
+窗口现在是一分钟（细）到二十一分钟（粗），范围是 ±30 秒（细）与 ±10 分钟（粗），朴素
+互相关在这两个尺度上都太贵，因此拆成**粗筛 + 细定**两级，并且用"形状"（滑动平均去掉
+起伏）而不是原始能量来比——**这两点都是实测出来的**，数字与依据见
+[audio-alignment.md](audio-alignment.md)：
 
 ```text
-对每对视频，在重叠窗口内对两条包络做互相关，取峰值位置 → 最佳 delta
+粗：把包络按 COARSE_DECIMATION 抽稀，在 ±COARSE_MAX_LAG_SEC 内全范围搜 → 延迟到
+    约一秒（粗级）或 40 毫秒（细级的粗筛）
+细：只在粗筛答案附近 ±FINE_REACH_SEC 上按原分辨率比，并取两者共有的中间一段 → 2 毫秒
+分数：在**整个重叠**上重新算，而不是在用来定时的那一小段上
+置信度：MIN_SCORE（绝对分）+ MIN_PROMINENCE（要比最好的远处对手高出一截），
+      否则不动任何偏移并如实说明
 ```
 
-窗口取 10 秒、20ms 一块 = 500 个采样点，朴素的 O(n²) 互相关只有 25 万次操作，纯 Python 几毫秒就完了。完全不需要 FFT。
-
-这可能是整个功能里**性价比最高的一环**：用户按一个按钮，三个视角自动对齐，频谱图退化为"验证 + 手动兜底"。
-
-限制要说清楚：
-
-- 只在**两段素材在窗口内确实有共同音频内容**时有效；
-- 静音录像完全无效（见 §9）；
-- 若两机位麦克风离得远、拾音内容差异大，相关性会很弱——需要给出置信度，弱相关时明确提示"未找到可靠匹配"，而不是硬给一个错的值。
+多条读数配对时还有一层：每一对都算，取"被最多其他录像认可"的那一路作为基准，各对之间
+不一致（超过 `CONFLICT_MS`）的偏移不采纳。见 `sync_audio.align()`。
 
 ## 9. 无音轨场景：缩略图胶片条　【已否决】
 
@@ -281,13 +332,33 @@ class AudioMonitor:
 
 **用户读到本节后否决了它**：实际素材里三路画面没有一致内容，这条并列手段不存在。
 
-## 10. 已知局限（需要在 UI 上诚实说明）
+## 10. 已知局限（界面与 README 都如实说了）
 
-1. **VLC 的 seek 精度不是帧精确的。** `set_time(ms)` 定位到关键帧附近再解码前进，实际落点与请求值可能有偏差。真正的逐帧精确要用**暂停 + 逐帧步进**（`next_frame` / `previous_frame` 动作已存在，`manual_seek` 已支持）。因此建议的精确流程是：**暂停 → 逐帧步进对齐 → "以当前位置为同步点"**，而不是反复加减偏移值。
-2. **不同 fps 之间不存在"共同帧"。** 25fps 与 30fps 的素材只能做到时间对齐，做不到帧号对齐。UI 里"±1 帧"必须明确是**该视频自己的帧**。
-3. **长录像会有时钟漂移。** 各机位晶振略有差异，录制数小时后固定偏移不再成立，需要**两点对齐**（同时解出偏移与速率偏差，用 `set_playback_rate` 补偿，范围 0.2–12 足够）。这应作为后续阶段，不应混进第一版。
-4. **音频延迟是另一个正交旋钮。** 如果某机位的**音视频本身**不同步（不只是机位之间不同步），要用已有的 `Video.audio_delay_ms`（`set_audio_delay`），不是本功能的偏移。两者都要，别混淆。
-5. **非等长素材的"同步播放"必然有一端先结束。** 对齐后较短的那路会先到片尾，此时应触发既有的 `VideoEndAction` 逻辑，而不是卡在越界提示上。
+现在的版本，逐条对照：
+
+1. **VLC 的 seek 精度不是帧精确的。** `set_time(ms)` 定位到关键帧附近再解码前进，
+   实际落点与请求值可能有偏差。所以拖动只改**数据**（偏移），松手 seek 一次；
+   要真正逐帧精确，用已有的 `next_frame` / `previous_frame` 动作。
+2. **不同 fps 之间不存在"共同帧"。** 25fps 与 30fps 只能做到时间对齐；对话框里的
+   `1 frame` / `10 frames` 是**该视频自己的帧**（`sync_offset_shift_frames` 按该路
+   fps 换算）。
+3. **长录像会有时钟漂移。** 各机位晶振不同，录几小时后固定偏移不再成立。现在**不做**
+   补偿（P2 不做、P7 未开工），长片看久了 seek 一次即复位。
+4. **音频延迟是另一个正交旋钮。** 某机位**音视频本身**不同步要用
+   `Video.audio_delay_ms`（`set_audio_delay`），不是本功能的偏移。
+5. **非等长素材的"同步播放"必然有一端先结束。** 越界时位置被钳住并提示（§5），
+   既有的 `VideoEndAction` 照常生效。
+6. **`±10 分钟`是相对现在的对齐状态。** 搜索范围从各路**当前**位置量起，差得比这更远
+   要先手动拉近；粗级还要求两段读数有一分钟以上的共同声音（短素材、只对上一部分的
+   素材因此更窄）。见 [audio-alignment.md](audio-alignment.md)。
+7. **一份录音里有另一份没有的内容时，一个偏移描述不了这一对**：插入点两侧需要的偏移
+   不同。细级读的是当前位置周围 60 秒、搜 ±30 秒，所以**正在看的那一侧**能对齐，
+   另一侧仍差一个插入长度。宽级在这种素材上给中间分数（实测 30 秒中插：0.58，
+   同源素材 1.00）。
+8. **混编码有约 100 毫秒的固定残差**（实测 PCM vs AAC 差 128 ms）；同一批设备出来的
+   文件互相抵消。
+9. **只对本机文件自动对齐**：流要每读一次抓一次，而本功能面向的是已经在本地的录像
+   （`_can_measure`）。
 
 ## 11. 分阶段实施
 
@@ -300,8 +371,11 @@ class AudioMonitor:
 | **P5 自动对齐** | 互相关 + 置信度 + "一键对齐" | P4 | **已实现**（`Align By Sound`） |
 | **P6 视觉胶片条** | 分析 player 抓帧 + 缩略图条 | P3 | **已否决**：实际素材三路画面无一致内容，见 §9 |
 | ~~P7 两点对齐~~ | 解偏移 + 速率偏差 | — | 未开工（长录像才需要） |
+| **P8 自动范围与界面重做** | 两级（粗/细）自动对齐到 ±10 分钟、并发读取、总频谱、拖动改偏移、步长微调 | P1–P5 | **已实现**，见第八个修正 |
 
-P1 与 P3 已交付并通过测试。P2 按决定不做，因此**对齐是暂停时完成、播放时保持**：任何一次 seek 都会按偏移把其他视频带到同一时刻，但播放期间不再主动纠偏。这意味着长时间播放会有缓慢漂移，重新 seek 一次即可复位。
+P1、P3、P4/P5、P8 都已交付并通过测试。P2 按决定不做，因此**对齐是暂停时完成、播放时
+保持**：任何一次 seek 都会按偏移把其他视频带到同一时刻，但播放期间不再主动纠偏。
+这意味着长时间播放会有缓慢漂移，重新 seek 一次即可复位。
 
 **P1 之后补上的一项（原设计漏了）**：播放/暂停状态原本不镜像，于是位置对齐了、一按播放又散开。现在在 OFFSET 模式下，任意一路的播放/暂停会作用于全体，且**开始播放前先按偏移重新对齐一次**——这样每次播放都从对齐状态起步，等于把"重新对齐"这个动作免费塞进了播放。它不需要 P2 的持续校正，因为只在用户意图发生时才动作，不会在播放中造成抖动。
 
@@ -398,7 +472,7 @@ P5 之后又改了三处，都在 [roadmap.md](roadmap.md) 的第 3~5 项里，
 
 ### 第六个修正：包络条画的是已经读到的那段声音，不是又去读一遍
 
-原设计的 P4 尾巴（§6.2 那一列、§7.4 的"按需片段 vs 实时滚动"）在这里收口：
+原设计的 P4 尾巴（对话框里那一列、§7.3 的"按需片段 vs 实时滚动"）在这里收口：
 **包络条不自己取数**，它画的就是 `Align By Sound` 刚读回来的那两条包络
 （对话框留着，交给 `widgets/sync_strip.py`）。于是它是"读完之后的兜底"，
 不引入第三条取数路径，也不需要 VLC 之外的东西。
@@ -443,6 +517,66 @@ P5 之后又改了三处，都在 [roadmap.md](roadmap.md) 的第 3~5 项里，
 [known-issues-and-risks.md](known-issues-and-risks.md)，由
 `tests/test_translation_extraction.py` 卡住不许再增加。
 
+### 第八个修正：±10 分钟自动对齐，界面按"用手操作"重做
+
+第七个修正之后拿去用，两个问题：
+
+1. **自动对齐的范围只有 ±12 秒**。多机位录像的起始时间差几分钟是常态，于是每次
+   都要人工先把各路拉到 10 秒以内（开两个窗口找同一个画面/声音，再逐路微调），
+   5 小时以上的素材尤其折磨人。
+2. **流程不直观**：`Set point`、`Align others to …`、`Align to` 三个概念要理解，
+   而"对齐到谁"与"我现在在动哪一路"是两件事。
+
+这一版按"打开窗口 → 按一次按钮 → 拖到对齐"重排：
+
+| 原来 | 现在 | 为什么 |
+| --- | --- | --- |
+| 只读一段 30 秒的包络，搜 ±12 秒 | **两级读数**：先读每路"自己位置 ±10 分钟"的一段（1 秒一块），对齐后再从同一段里取 **60 秒**（2 毫秒一块，搜 ±30 秒）细对齐 | 两段读数在错位几分钟时毫无重叠，搜索范围再大也答不出来；而宽读数与细读数**共用一次解码**（见下）。细级取 60 秒而不是 30 秒，是为了"一份录音里插了一段内容"这种素材：插入点两侧需要的偏移不同，60 秒的读数让**正在看的那一侧**也能当场对上（实测插入 30 秒、暂停在插入点之后：shift +30000，分数 1.00） |
+| `MAX_LAG_SEC = 12` 是唯一的范围 | `FINE_SCALE` 与 `COARSE_SCALE` 两套常量，`best_lag/measure_pairs/align` 带 `Scale` 走 | 1 秒一块时"最小重叠 1 秒""池化 20 块"这些数全是错的：池化 20 块 = 20 秒，粗搜索会被摊平的形状带偏（实测 64 对里错 4 对；池化 5 块则 64/64） |
+| 一路一路顺序读 | **每路一个线程**，`SnippetCache` 按录像加锁 | 5 小时录像读到第 4 小时约 48 秒/路，三路顺序读是 2.5 分钟，并发是 ~50 秒 |
+| 行内 `Set point`、底部 `Align others to …` | **都去掉**（右键菜单里的 `Set Sync Point Here` 保留） | 手动路径改由"拖动频谱"承担：拖就是改偏移，画面跟着走，不需要再理解"登记"和"以谁为准" |
+| `Align to` 单选 = 别人对齐到谁 | 同一列改成"**Working on**"：现在在动哪一路 | 拖动需要一个"动谁"的答案，而这个答案全局只能有一个 |
+| 每行都画"基准的灰波形 + 本行的波形" | **每行只画自己的**；顶部新增**总频谱**，所有路各自颜色半透明叠画，被操作的一路最后画、更实 | 行里叠两条本来就读不清"谁对谁"；重合关系只需要在一个地方看，就是总频谱 |
+| 标尺每行画一遍 | 只在总频谱上画一遍 | 同一把尺子画三遍 |
+| 双击 = Fit | 双击 = **选这条频谱的颜色**（Fit 仍在按钮上） | 颜色要按文件记住（`models/spectrum_colors.py`，存设置不存播放列表） |
+| 微调按钮固定 ±10s/±1s/±10f/±1f | **步长下拉**（1ms/10ms/100ms/1s/10s/1帧/10帧）+ 每行 `−`/`+` | 声音对齐后残余只有几十毫秒，1 帧（25fps=40ms）已经太粗；八个按钮一排又太宽 |
+
+几个实现上的要点：
+
+* **一次解码两用**：宽读数是从文件头解码到 `position + H`（`H = 10 分钟 +
+  60 秒 + 余量`），细读数要的那 60 秒就在这段里（粗对齐会把视频最多挪 10 分钟，
+  所以 `H` 必须带上这一段）。`SnippetCache` 只认"要过的最深时刻"，两次请求自然
+  命中同一份 wav；`WIDE_READ_MS` 就是按这个推出来的。
+* **拖动期间不 seek**：`sync_offset_drag(offset)` 只改值，`
+  sync_offset_drag_drop()` 才 seek 一次到"起点 + 总位移"，`sync_offset_drag_give_up()`
+  （Esc）原样放回。每个像素一次 seek 会把 VLC 打爆。
+* **拖动改的是偏移，画面跟着走**：`sync_offset_set` 的语义是"保持共同时刻、画面
+  跳到新位置"，所以把 B 的频谱左拖 200ms = `o_B += 200` = B 的画面向前跳 200ms，
+  A/C 一动不动——这正是手动对齐想要的。拖动中"共同时刻不变"这个不变量被暂时打破、
+  松手恢复。
+* **粗级不猜**：粗搜索给出的答案若分数低于阈值，或者各对互相矛盾，就报"没找到"，
+  一个字节都不改；细级再用原来的阈值复核。实测粗级挑错峰时分数只有 0.02~0.11，
+  不会给出"看起来自信的错值"。
+* **没有"参考视频"这个数据概念**：`_run_reference_id` 仍然存在，但只是"这次读数里
+  被最多路认可的那一路"，用于报告；界面上的单选只表示"现在动哪一路"，零点是
+  "读数那一刻的共同时刻"，与谁被选中无关。
+* **报告要说清两级各做了什么**（用户实测后补）：界面原先只报细级，于是"粗级已经把
+  偏移改好了、细级对当前位置周围的声音无话可说"时，会显示成"什么都没对齐 /
+  没有相似的内容"。现在这一种情况有自己的文案（`_nothing_close_note`）：
+  说明更宽的那段已经把三路对齐到一秒以内，并提示把视频挪到两路都有内容的位置
+  再按一次。
+* **"读取声音"按钮**（用户实测后补）：包络条要有东西可画，前提是读过声音，而原先
+  读声音的唯一入口是 `Align By Sound`——那会顺带改偏移、动画面。现在有一个只读的
+  按钮：读当前位置周围的 60 秒、画出来，**不判定、不改偏移、不 seek**，因此也不受
+  同步模式影响（细级读数本来就是从文件里读，与模式无关）。
+* **"同步偏移"勾选框**（用户实测后补）：模式原先只能在右键菜单里开关，而菜单被
+  对话框挡着——要看一眼对齐结果就得先关窗。现在对话框里有勾选框，直接调
+  `VideoBlocksManager._set_offset_mode`，关掉时恢复打开前的模式（Percent/Timecode
+  不会被悄悄改成 Disabled）。勾选框每 200ms 与真实模式同步一次，菜单里改了它也跟。
+* **提示文本改成编号步骤**，每条一行，控件名用 `format` 从控件自己的标签取
+  （`{ALIGN}`/`{READ}`/`{WORKING_ON}`/`{MOVE_BY}`/`{FIT}`）：提示里说的按钮名和
+  按钮上写的是同一个字符串，不会一处改了另一处没改。
+
 ### P3 的实现与设计的差异
 
 | 设计里写的 | 实际实现的 | 原因 |
@@ -467,7 +601,22 @@ P5 之后又改了三处，都在 [roadmap.md](roadmap.md) 的第 3~5 项里，
 
 ## 12. 涉及文件
 
-### P1（核心）
+**这张表是现在的样子**（P8 那节就是当前代码；下面 P1/P2 两张是当时的计划，留着看
+哪些设想没做）：
+
+| 文件 | 现在的职责 |
+| --- | --- |
+| `utils/sync_audio.py` | 包络、两级搜索、配对与判定、`SnippetCache`、全部常量与 `Scale` |
+| `utils/sync_align.py` | `AlignMeasure`：每路一个 `_Reader` 线程，`progress` / `measured` 信号 |
+| `vlc_player/audio_probe.py` | 独立实例的 player，把一段声音转码成 wav 再算包络 |
+| `dialogs/align_videos.py` | 对话框：两级流程、总频谱、拖动改偏移、步长、颜色、读取声音、模式勾选框 |
+| `widgets/sync_strip.py` | 条子：`SyncSoundStrip`（本行）/ `SyncOverviewStrip`（叠画） |
+| `models/spectrum_colors.py` | 颜色按文件路径存在设置里 |
+| `widgets/video_block.py` | 偏移读写、拖动三方法、越界状态与提示 |
+| `player/managers/video_blocks.py` | 偏移感知的 seek 镜像、`_is_offset_mode` / `_set_offset_mode`、颜色与步长命令 |
+| `settings.py` | `playlist/spectrum_colors`、`playlist/sync_nudge_step` |
+
+### P1（核心）　—— 当时的计划
 
 | 文件 | 改动 |
 | --- | --- |
@@ -475,15 +624,15 @@ P5 之后又改了三处，都在 [roadmap.md](roadmap.md) 的第 3~5 项里，
 | `params/static.py` | `SeekSyncMode.OFFSET` |
 | `params/defaults_fields.py` | `_seek_sync_modes()` 增加一项 |
 | `params/actions.py` | 同步点/微调/清除/显示/打开对话框 等动作 |
-| `params/menu.py` | 把上述动作放进 Seek Sync 或新的 Alignment 子菜单 |
-| `settings.py` | 三个新设置键 |
+| `params/menu.py` | 把上述动作放进 `Sync Offset` 子菜单（原计划写的是 "Seek Sync 或新的 Alignment 子菜单"） |
+| `settings.py` | 原计划"三个新设置键"——**没做**，见 §3.3 |
 | `player/managers/video_blocks.py` | 偏移感知的同步、对齐计算、新命令 |
-| `player/managers/active_block.py` | 新的 `is_active_*` 判定；必要时把命令加入 `LOADING_COMMANDS` |
+| `player/managers/active_block.py` | 新的 `is_active_*` 判定（`is_active_seekable`、`is_active_offset_in_frames`） |
 | `widgets/video_block.py` | 偏移读写、越界状态与提示、参与对齐 |
-| `widgets/video_status_info.py` | "越界"状态文案（或新增状态类型） |
+| `widgets/video_status_info.py` | 未单独改：越界文案走 `sync_out_of_range_txt`（`video_block.py`） |
 | `tests/test_sync_offset.py`（新） | 语义、边界、越界、持久化 |
 
-### P2 起
+### P2 起（当时的计划）
 
 | 文件 | 改动 |
 | --- | --- |
@@ -494,41 +643,87 @@ P5 之后又改了三处，都在 [roadmap.md](roadmap.md) 的第 3~5 项里，
 | `utils/sync_align.py`（新，已交付） | 在 `QThread` 上逐路读取，界面不阻塞 |
 | `widgets/sync_strip.py`（新，已交付） | 每行一条包络条，基准与本行叠着画 |
 
-## 13. 测试（P1，已实现）
+### P8（自动范围与界面重做）
 
-`tests/test_sync_offset.py`，P1 部分 46 个用例（其后 P3~P5 又加了一批，
-与 `tests/test_sync_audio.py` 合计 164 项，其中 127 项不需要 VLC）：
+| 文件 | 改动 |
+| --- | --- |
+| `utils/sync_audio.py` | `Scale`（`FINE_SCALE`/`COARSE_SCALE`）、`WIDE_READ_MS`/`FINE_SNIPPET_MS`、`Lag.blocks_per_sec`、宽窗口包络的抽稀快路径、`SnippetCache` 按录像加锁 |
+| `utils/sync_align.py` | `ReadingRequest`（每路一条，带分辨率）、每路一个 `_Reader` 线程、`progress` 信号、取消时等待手上的读数 |
+| `vlc_player/audio_probe.py` | `envelope(..., blocks_per_sec=…)`，默认跨度改从 `sync_audio` 取 |
+| `dialogs/align_videos.py` | 两级流程（`_measured_wide` → `_start_close_pass` → `_measured`）、进度文案、顶部总频谱、每行只画自己、零点、`Working on` 列、拖动改偏移、步长下拉、去掉 `Set point` 与 `Align others` |
+| `widgets/sync_strip.py` | `_ClockStrip` 拆出「一条/多条」两种条子：`SyncSoundStrip`（本行自己的声音，拖它=改偏移）、`SyncOverviewStrip`（全部叠画）、`DrawnSound`、颜色 |
+| `models/spectrum_colors.py`（新） | 频谱颜色按文件路径存在 `playlist/spectrum_colors`，上限 `KEPT_COLORS`，不进播放列表 |
+| `widgets/video_block.py` | `sync_offset_drag` / `sync_offset_drop` / `sync_offset_drag_give_up` |
+| `settings.py` | `playlist/spectrum_colors`、`playlist/sync_nudge_step` |
 
-1. **偏移的读写**（`sync_offset_txt` / `parse_sync_offset_txt`）：带符号的时间显示、fps 已知时的帧数、fps 未知时不显示帧数、各种输入写法（`1:15.000`、`+1:15.000`、`-0:05`、纯秒数）、非时间输入返回 `None`、以及"写出去再读回来"的往返。
-2. **持久化**：`.gpls` 往返（正/负偏移）、未设置时 `sync_offset_ms` **不出现在文件里**、未设置读回为 `None`、没有该字段的旧播放列表读入为 `None`。
-3. **偏移如何承载 seek**：用 `tests/test_close_teardown.py` 的"记录调用序列"范式，把真实的 `VideoBlocksManager.seek_sync_offset` 绑到一个只含它能读到的字段的 stub 上。覆盖用户给的原始例子（5s / 1:15 / 48s 三路互相对齐）、源视频自己不动、暂停状态被带到其他视频、偏移全未设置时退化为同一时刻、非 OFFSET 模式不动作、源视频已消失时不动作。
-4. **表的一致性**（补上了 `known-issues-and-risks.md` 指出的缺口）：
-   - `SECTIONS` 里每个 id 都是 `ACTIONS` 里真实存在的动作（递归遍历所有分段与子菜单）；
-   - 每个子菜单名都在 `SUBMENUS` 里；
-   - 每个动作都有 `func` 或 `menu_generator`。
+## 13. 测试
 
-   这三条把"`SECTIONS` 里写错一个 id → 右键时才 `KeyError`"这类问题变成构建期失败，这正是本功能新增 8 个动作后最需要的一道网。
-5. **OFFSET 模式的接入**：枚举值、以及它出现在设置表单的 `_seek_sync_modes()` 里。
+**现在的数字**：`tests/test_sync_offset.py` 161 项、`tests/test_sync_audio.py` 94 项，
+合计 **255 项**；其中 42 项标了 `needs_vlc`（本机没装 VLC 时跳过，CI 上全跑），
+其余 213 项在任何机器上都跑。整套 3654 项通过（另有 3 项网络环境相关失败，与本功能
+无关）。
 
-尚未覆盖（需要真实播放，属于 P3 之后）：`apply_sync_position` 里的越界钳制与提示文案（`_set_sync_out_of_range` / `clear_sync_out_of_range`）、以及在真实 VLC 上验证 seek 落点精度。
+覆盖的东西：
 
-P4/P5 另需：包络数值正确性（合成正弦/冲击信号喂给纯函数）、互相关在已知偏移下能恢复出该偏移、弱相关时返回"不可靠"而非错值。
+1. **偏移的读写**（`sync_offset_txt` / `parse_sync_offset_txt`）：带符号的时间显示、fps
+   已知时的帧数、fps 未知时不显示帧数、各种输入写法（`1:15.000`、`+1:15.000`、`-0:05`、
+   纯秒数）、非时间输入返回 `None`、以及"写出去再读回来"的往返。
+2. **持久化**：`.gpls` 往返（正/负偏移）、未设置时 `sync_offset_ms` **不出现在文件里**、
+   未设置读回为 `None`、没有该字段的旧播放列表读入为 `None`。
+3. **偏移如何承载 seek**：把真实的 `VideoBlocksManager.seek_sync_offset` 绑到一个只含它
+   能读到的字段的 stub 上，覆盖用户给的原始例子（5s / 1:15 / 48s 三路互相对齐）、
+   源视频自己不动、暂停状态被带到其他视频、偏移全未设置时退化为同一时刻、非 OFFSET
+   模式不动作、源视频已消失时不动作。
+4. **播放/暂停也镜像**（P1 之后补的）：任意一路的播放/暂停作用于全体，且**开始播放前
+   先按偏移重新对齐一次**。
+5. **表的一致性**：`SECTIONS` 里每个 id 都是 `ACTIONS` 里真实存在的动作（递归遍历所有
+   分段与子菜单）、每个子菜单名都在 `SUBMENUS` 里、每个动作都有 `func` 或
+   `menu_generator`。这把"`SECTIONS` 里写错一个 id → 右键时才 `KeyError`"变成构建期
+   失败。
+6. **两级搜索本身**（`test_sync_audio.py`）：已知延迟在 1 秒一块与 2 毫秒一块两个尺度上
+   都能恢复、无关素材被阈值挡住、超出范围返回"没找到"、读数长度不同时共享段按两者
+   界定（`TestReadingsOfDifferentLengths`，钉住 40/60/80/100 秒的插入）、以及包络在粗级
+   尺寸下的抽稀路径。
+7. **对话框**：两级流程的先后与信号（`_measured_wide` → `_start_close_pass` →
+   `_measured`）、进度文案、拖动（`TestDraggingASyncPoint`：拖动中不动画面、松手只 seek
+   一次、Esc 原样放回）、步长与 −/+、颜色选择与记忆、总频谱叠画、**读取声音不动任何
+   东西**、**同步偏移勾选框**、编号步骤提示里的控件名与顺序。
+8. **真实文件**（`needs_vlc`）：`TestTwoRecordingsThatBeganAMinuteApart` 用两个真实 wav
+   （同一事件相隔一分钟）走完整条路；`TestReadingEveryRecordingAtOnce` 跑真的
+   `AlignMeasure`（多线程），验证每路都回来、进度有得可循、读不出来的文件也照样
+   "回答"、以及宽读之后的细读不再解码。
 
-> 说明：本机没有安装 VLC，因此 VLC 相关用例用 `needs_vlc` 标记为 skip，无 VLC 时仍可运行其余部分。CI（装有 libvlc）会全部执行。这是本功能附带的一个小改进：`tests/test_sync_offset.py` 是套件里第一个能在无 VLC 机器上部分运行的测试文件。
-
-后来这些标记得太宽：纯算术、对话框、动作表那几组碰不到 libVLC，标着只是白扔覆盖率。现在只有真正 import 到播放器的那三组留标记，其余（含整个对齐对话框与"对齐如何拼装"那两组）在无 VLC 机器上照样跑。另见 [testing.md](testing.md) 的 "Tests that need VLC"。
+仍未覆盖：真实 VLC 上的 seek 落点精度（wav 上误差 +1 ms，视频容器上差得多，见
+known-issues-and-risks.md 的第一条风险），以及真实的多机位素材——那是 roadmap 里
+第 2 项，仍然只有合成素材与小规模真实素材的证据。
 
 ## 14. 已决定的问题
 
-1. **方向的措辞与符号** —— 决定：**不引入 `delta` 这个词**。菜单里用"Sync Point Forward / Back"（同步点前移/后移），描述的是**该视频自己时间轴上的位置**，客观且不会被读反；偏移值本身带符号显示（`+01:15.000`）。若日后加了 P3 的参考视频列，那一列才用"相对参考视频靠前/靠后"，因为有参照系才谈得上前后。
-2. **旧的 PERCENT / TIMECODE** —— 决定：**原样保留在菜单里**。`SeekSyncMode` 现在是 Disabled / Percent / Timecode / Offset 四项，旧播放列表的值照旧可读，行为不变，也不加迁移。
-3. **是否需要 P2 持续校正** —— 决定：**不做**。"暂停对齐好再播放即可"。因此没有新增任何与本功能相关的设置项（原设计的 `sync_offset_enforce`、`sync_offset_drift_frames` 都没有实现）。代价是长时间播放会缓慢漂移，重新 seek 一次即复位。
-4. **素材有没有音轨** —— 决定：**有音轨**，因此 P4（音频包络）与 P5（互相关自动对齐）优先，P6（视觉胶片条）降级为无音轨素材时的后备。
-5. **帧还是毫秒作主单位** —— 决定：**内部存毫秒，UI 同时显示帧数**。`sync_offset_ms` 是 `int`；`sync_offset_txt(offset, fps)` 在 fps 已知时附上帧数；`±1 帧` 按该视频自身 fps 换算（`sync_offset_shift_frames`），fps 未知时该动作灰显（`is_active_offset_in_frames`）。
+1. **方向的措辞与符号** —— 决定：**不引入 `delta` 这个词**。菜单里用"Sync Point
+   Forward / Back"（同步点前移/后移），描述的是**该视频自己时间轴上的位置**，客观且
+   不会被读反；偏移值本身带符号显示（`+01:15.000`）。对话框里那一列叫 `Sync point`。
+2. **旧的 PERCENT / TIMECODE** —— 决定：**原样保留在菜单里**。`SeekSyncMode` 现在是
+   Disabled / Percent / Timecode / Offset 四项，旧播放列表的值照旧可读，行为不变，
+   也不加迁移。
+3. **是否需要 P2 持续校正** —— 决定：**不做**。"暂停对齐好再播放即可"。因此没有新增
+   任何与本功能相关的设置项（原设计的 `sync_offset_enforce`、`sync_offset_drift_frames`
+   都没有实现，见 §3.3）。代价是长时间播放会缓慢漂移，重新 seek 一次即复位。
+4. **素材有没有音轨** —— 决定：**有音轨**，因此 P4（音频包络）与 P5（互相关自动对齐）
+   做了。P6（视觉胶片条）**已否决**：实际素材三路画面没有一致内容（§9），不是"后备"，
+   是不成立。
+5. **帧还是毫秒作主单位** —— 决定：**内部存毫秒，UI 同时显示帧数**。`sync_offset_ms`
+   是 `int`；`sync_offset_txt(offset, fps)` 在 fps 已知时附上帧数；`±1 帧` 按该视频
+   自身 fps 换算（`sync_offset_shift_frames`），fps 未知时该动作灰显
+   （`is_active_offset_in_frames`）。对话框的 `Move by` 里也有 `1 frame` / `10 frames`
+   两项，同样按该路 fps 换算。
 
-### 仍未定、留给 P3 及以后
+### 仍未定 / 仍开着的（现状在 [roadmap.md](roadmap.md)）
 
-- 对齐对话框里是否需要一个"参考视频"列（只为显示"相对参考"的差值，不影响存储语义）。P5 之后基准由声音自动选，这一列仍未加。
-- 互相关的置信度阈值，以及弱相关时的提示措辞。见 §11 第五个修正：现在有两个判据（`MIN_SCORE` 与 `MIN_PROMINENCE`），措辞落在对话框底部的说明里。
-- 是否需要 P7 的两点对齐（偏移 + 速率），取决于素材时长是否长到晶振漂移可感。
-- 包络的取数策略已定：按需片段（见 §7.4），读过的片段留着复用。
+- **真实素材验证**（roadmap 第 2 项）：宽级自动对齐在真实多机位素材上的表现仍然只有
+  合成素材与小规模真实素材的证据。
+- **置信度阈值**：现在有两个判据（`MIN_SCORE` 与 `MIN_PROMINENCE`），措辞落在对话框
+  底部的说明里；弱相关时是否还要更细的分级（"只对上一部分"之类）没有定。
+- **是否需要 P7 的两点对齐**（偏移 + 速率）：取决于素材时长是否长到晶振漂移可感。
+- **流媒体的自动对齐**：`_can_measure` 只认本机文件，要不要支持流没有定。
+- **分段偏移**：一份录音里有另一份没有的内容时，理论上一对需要多个偏移（§10 第 7 条）。
+  这属于与 P7 同类的破坏性改动，未定。

@@ -305,18 +305,22 @@ Then, before your first substantial change:
 ## Fragile: audio alignment (`Align By Sound`)
 
 Everything here was measured rather than reasoned about, because the obvious
-reasoning was wrong three times. See [audio-alignment.md](audio-alignment.md) for
+reasoning was wrong five times. See [audio-alignment.md](audio-alignment.md) for
 the measurements and [roadmap.md](roadmap.md) for what is still open.
 
 | Risk | Consequence | Guard |
 | --- | --- | --- |
 | Seeking into a **video container** misses by up to ~1 s, invisibly | A wrong offset that still scores 1.000 — no threshold can catch it | Read from the file's start; never `:start-time`. `Reading.origin_ms` exists for this |
 | Comparing **loudness** rather than the shape of the sound | Real multi-camera material scores 0.2 and gets skipped, so the button does nothing | `_shaped()`; measured 0.34 (loudness) vs 0.67 (shape) on the same pair |
-| `MIN_SCORE` is an absolute correlation | Sensitive to the material, not to whether the answer is right | Under review — see roadmap item 4 (peak prominence) |
-| Setting an offset **does not move a video** (`p − o` preserved) | Offsets corrected, videos no closer together; looks like the button did nothing | `_measured()` ends with `sync_offset_align_others()` |
-| The reference is **the first row** | If that video is the odd one out, the others are aligned to it | Single-pair measurement is the weak point — roadmap item 5 |
-| Reading costs ~position ÷ 300 s | Repeated alignment re-reads everything; an hour-long recording is ~6 s per video | Nothing yet — roadmap item 3 (cache) |
+| A **score is absolute** correlation | What a high score is worth depends on the material | `MIN_PROMINENCE`: the answer must also stand a quarter above its best distant rival, or nothing moves |
+| A **whole recording is the reference**, not one chosen by the user | If that video is the odd one out, the others are aligned to it | The reference is the one the *other recordings agree with most* (`_reference_of`), and every pair is compared; the first row is only the initial pick for `Working on` |
+| Setting an offset **does not move a video** (`p − o` preserved) | Offsets corrected, videos no closer together; looks like the button did nothing | The automatic run ends with `sync_offset_align_others()`; a drag ends with `sync_offset_drop()`, which seeks by what the offset moved by |
+| Reading costs ~position ÷ 300 s (plus ten minutes either way) | Repeated alignment re-reads everything; an hour-long recording is ~6 s per video | `SnippetCache` keeps the stretch read so far, the wide read is what the close one is taken out of, and the recordings are read **one thread each** — a grid of three pays for the slowest, not the sum |
 | Transcode adds a **codec-dependent constant** (128 ms measured, PCM vs AAC) | Residual of ~100 ms when a set mixes codecs | Documented in the UI-facing limitations; cancels for a matched set |
+| A recording that holds **something the other does not** (a section added or cut) | **No one offset describes the pair**: together on one side of the change, a section apart on the other. The wide pass comes to a middling score — measured 0.58 where a matched pair comes to 1.00 — and whatever it settles on is right for one side only | The close pass reads ±30 s around the moment the videos are on, so **the side being watched** is what gets lined up, and the note says what each pass did rather than only what the last one found |
+| **Short recordings** leave little room for a lag | The coarse pass believes a lag only where a minute of the two is still shared, and two 2-minute files at a lag of 100 s have less than that once the *readings* bound it | The overlap at a lag is bounded by **both** readings (`_overlap`) — see the trap below, this was wrong and cost a user their files |
+| The close pass reads **around where the videos are** | The same pair can be lined up two ways depending on where the viewer paused | By design: the strips show where each video is, and the note names what was aligned. Pausing somewhere both recordings cover is the way to be sure |
+| The two scales do **not** share their constants | A number that is right at 2 ms a block is wrong at 1 s a block: pooling twenty is 40 ms at one and 20 s at the other | One `Scale` per pass (`FINE_SCALE`, `COARSE_SCALE`), and the coarse numbers were measured over 64 synthetic pairs rather than reasoned about |
 
 ## Traps that have already bitten
 
@@ -336,6 +340,29 @@ real, video-container path is out by a second. Test the path the user has.
 loudness alone scores below the threshold; the real recordings score 0.34, the
 synthetic fixture 0.70. The assertion was deleted rather than the fixture bent
 until it agreed.
+
+**A bound that is right at one size of reading is wrong at the other.** The
+overlap between two readings at a lag was worked out as `reference[:len - lag]`
+against `other[lag:]`, which is exactly right while the two readings are the same
+length — and the close pass's always are, both being the snippet that was asked
+for. The wide pass's never are: two minutes of a recording against the same two
+minutes with a section added in front is 119 blocks against 219, and at the lag
+that lines them up the old sum left 19 blocks of a 120-second recording, below the
+minute of shared sound a lag is believed on. **Every lag past about a minute went
+unlooked at**, and a user's pair of short files came back as "nothing like the
+other" for a section of 80 or 100 seconds while 40 seconds worked — the failure
+looked like a threshold problem and was arithmetic. `_overlap` now bounds the
+share by both lengths, and `TestReadingsOfDifferentLengths` pins 40, 60, 80 and
+100 seconds.
+
+**A close look whose window cannot move does not look at negative lags.** The
+same shape of mistake one layer down: `_fine_lag` took a window from the middle
+of one reading and looked for it in the other, which can only be done where the
+window *fits*. A reading barely longer than the window — the wide pass's shape,
+minutes of a recording against a window of minutes — had nowhere to put it but
+where it already was, so every negative lag was skipped and the answer came back
+as no lag at all. Four seconds of a snippet against a snippet has room to spare,
+which is why the fine scale never showed it.
 
 **`getattr(mock, name, default)` does not return the default.** A `Mock` context
 answers with a truthy child `Mock`, so a guard written as

@@ -339,10 +339,27 @@ patterns, and it is worth knowing which one a file uses:
   that has no VLC.
 
   Where a test needs a recording to read, it writes a **temporary wav** with
-  `wave` (`_write_clicks`, `_write_irregular_bursts` in `test_sync_audio.py`)
-  rather than shipping a media file: bursts of known lengths at known moments
-  say what the reading should have come back with, and the same file can be read
-  from two positions to measure the error of the whole path.
+  `wave` (`_write_clicks`, `_write_irregular_bursts` in `test_sync_audio.py`,
+  `_write_a_cut_of_the_event` for two cuts of one event) rather than shipping a
+  media file: bursts of known lengths at known moments say what the reading
+  should have come back with, the same file can be read from two positions to
+  measure the error of the whole path, and two cuts of one event a known
+  distance apart are what the two passes are tested end to end on.
+
+  Two of those tests are worth knowing before changing anything about the
+  search, because nothing else covers what they cover:
+
+  * `TestTwoRecordingsThatBeganAMinuteApart` runs the whole chain over two real
+    files — wide read, coarse align, then a snippet read out of what the wide
+    one decoded — and asserts the minute comes back exactly. A minute is what
+    the close pass alone cannot see any part of, so a regression in either pass
+    or in the sharing between them shows up here and nowhere else.
+  * `TestReadingEveryRecordingAtOnce` runs `AlignMeasure` for real, over
+    threads, and pins the two properties a dialog depends on: every reading
+    comes back (including "there is no sound in this file"), and each one is
+    reported as it arrives. A run that never says it is done is a dialog that
+    waits for ever, which is a bug no unit test of the reading itself would
+    catch.
 
 ## What to test when you change something
 
@@ -356,7 +373,7 @@ patterns, and it is worth knowing which one a file uses:
 | Stream resolution | `tests/test_resolver_yt_dlp_*.py`, `tests/test_url_resolve_worker.py`. |
 | The proxy | A `tests/test_stream_proxy_*.py` test with a real localhost server. |
 | Grid/drop behaviour | `tests/test_grid_layout.py`, `tests/test_managers_grid.py`, `tests/test_drag_n_drop.py`. |
-| Anything in the sound of a recording, or in lining recordings up | `tests/test_sync_audio.py` (the arithmetic, the cache of what was read, placing a reading on the clock, and the pairing up of several readings). |
+| Anything in the sound of a recording, or in lining recordings up | `tests/test_sync_audio.py` (the arithmetic, the cache of what was read, placing a reading on the clock, the pairing up of several readings, and the two scales `best_lag` searches at). |
 | The alignment dialog, offsets, a seek carried between videos, or the envelope strips | `tests/test_sync_offset.py`. |
 | Anything touching a `translate()` call site | `tests/test_translation_timing.py` must still pass. |
 

@@ -29,6 +29,7 @@ All models are **pydantic v2 `BaseModel`s** in `gridplayer/models/`.
 | `Bookmark` | `bookmark.py:26` | One named position, with an optional colour. |
 | `VideoBlockMime` | `video.py:316` | The drag-and-drop payload for a video. |
 | `KeymapOverrides` | `keymap_overrides.py` | Sparse shortcut overrides (stored in settings, not playlists). |
+| `SpectrumColors` | `spectrum_colors.py` | The colour each recording's sound is drawn in, by file path (stored in settings, not playlists — a colour says nothing about the file). |
 | `RecentList*` | `recent_list.py` | The recent-videos and recent-playlists lists. |
 | `Stream`, `Streams`, `StreamSessionOpts`, `StreamOrigin`, `StreamFragment` | `stream.py` | Resolved stream data. Covered in [streaming-and-network.md](streaming-and-network.md). |
 | `AudioSelection` family | `audio_selection.py` | How audio was chosen — see below. |
