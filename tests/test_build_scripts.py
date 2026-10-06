@@ -101,6 +101,74 @@ class TestWhatAMachineHasToHave:
 
         assert found.returncode == 0, f"{name} is not on PATH"
 
+    def test_an_interpreter_that_will_not_run_is_passed_over(self):
+        """`command -v python3` finds the Windows Store's redirector on a
+        checkout whose Store Python is turned off. It is not an interpreter: it
+        exits 49 and prints nothing, and a build that takes it for one dies at
+        the first thing it runs -- measured here, `zip_dir` on a Windows
+        checkout, with nothing on stdout or stderr to say why.
+        """
+
+        done = _run(
+            'stub="$(mktemp -d)"\n'
+            "printf '#!/bin/sh\\nexit 49\\n' > \"$stub/python3\"\n"
+            'chmod +x "$stub/python3"\n'
+            'chosen="$(PATH="$stub:$PATH" build_python)"\n'
+            'printf "%s\\n" "$chosen"\n'
+        )
+
+        assert done.returncode == 0, done.stderr
+
+        chosen = done.stdout.strip()
+
+        assert chosen != "python3", "the stub on PATH was taken for an interpreter"
+
+        if chosen:
+            runs = subprocess.run(
+                [BASH, "-c", f'"{chosen}" -c ""'],
+                capture_output=True,
+                text=True,
+            )
+
+            assert runs.returncode == 0, f"{chosen} does not run"
+
+    def test_the_requirements_a_build_installs_are_compiled_when_they_are_missing(
+        self,
+    ):
+        """`scripts/build_win.cmd` does not go through `just`, and
+        `just build-requirements` is what used to compile this file. Without it
+        the build died at `pip install -r` naming a path nothing had written --
+        the one step of a build that no script did at all.
+        """
+
+        done = _run(
+            'stub="$(mktemp -d)"\n'
+            "cat > \"$stub/uv\" <<'STUB'\n"
+            "#!/bin/sh\n"
+            'printf "%s\\n" "$@" > "$(dirname "$0")/args"\n'
+            'printf "called\\n" >> "$(dirname "$0")/calls"\n'
+            "while [ $# -gt 0 ]; do\n"
+            '    if [ "$1" = "-o" ]; then printf "stub==1\\n" > "$2"; fi\n'
+            "    shift\n"
+            "done\n"
+            "STUB\n"
+            'chmod +x "$stub/uv"\n'
+            'BUILD_DIR="$(mktemp -d)"\n'
+            'PATH="$stub:$PATH" make_requirements\n'
+            'PATH="$stub:$PATH" make_requirements\n'
+            'printf "calls=%s\\n" "$(grep -c called "$stub/calls")"\n'
+            'printf "requirements=%s\\n" "$(cat "$BUILD_DIR/requirements.txt")"\n'
+            'cat "$stub/args"\n'
+        )
+
+        assert done.returncode == 0, done.stderr
+
+        # asked for once and kept: a second build reuses what was resolved
+        assert "calls=1" in done.stdout
+        assert "requirements=stub==1" in done.stdout
+        assert "pyproject.toml" in done.stdout
+        assert "--universal" in done.stdout
+
     def test_a_download_already_made_is_left_alone(self):
         """A second build reuses the VLC it embedded last time rather than
         fetching 83 MB again."""

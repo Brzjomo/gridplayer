@@ -11,9 +11,15 @@ die() {
 # is the name on Windows: python.org, the Microsoft Store and Anaconda all
 # install that one and nothing else, which is why creating a build venv used to
 # fail on a Windows checkout with a perfectly good Python on PATH.
+#
+# Being on PATH is not enough to be an interpreter: a Windows checkout whose
+# Store Python is turned off still has a `python3` -- a redirector that exits 49
+# and prints nothing -- and it is found first. Taking it for one breaks the
+# build at the first thing it runs. So a candidate has to run before it is
+# chosen, and one that cannot is passed over like one that is not there.
 build_python() {
     for candidate in python3 python; do
-        if command -v "$candidate" &> /dev/null; then
+        if command -v "$candidate" &> /dev/null && "$candidate" -c "" &> /dev/null; then
             printf '%s\n' "$candidate"
             return
         fi
@@ -190,6 +196,35 @@ copy_with_app_vars() {
 
     cp "$SOURCE_FILE" "$DEST_FILE"
     replace_app_vars "$DEST_FILE"
+}
+
+# The requirements a build installs, compiled from pyproject.toml.
+#
+# `just build-requirements` compiles this for the builds that go through
+# `just`, and scripts/build_win.cmd is one that does not: it used to die at
+# `pip install -r` naming a file nothing had written. Every build script asks
+# for it here instead, so the path that skips `just` is not the path that
+# breaks. Kept if it is already there, which is what a second build relies on.
+#
+# Resolved for the interpreter the build will install into, not for whatever
+# `uv` finds first. On a checkout whose `.venv` is 3.12 and whose `python` is
+# 3.10 -- which is what uv creating a venv and python.org installing one comes
+# to -- a universal resolution taken for 3.12 pins a package that needs 3.11,
+# and the build venv cannot install it:
+#
+#   ERROR: No matching distribution found for websockets==17.2
+make_requirements() {
+    REQUIREMENTS_FILE="$BUILD_DIR/requirements.txt"
+
+    if [ -f "$REQUIREMENTS_FILE" ]; then
+        return
+    fi
+
+    mkdir -p "$BUILD_DIR"
+
+    uv pip compile "$ROOT_DIR/pyproject.toml" \
+        -q --universal --no-annotate --no-header \
+        --python "$(build_python)" -o "$REQUIREMENTS_FILE"
 }
 
 init_venv() {

@@ -105,6 +105,8 @@ PYINSTALLER_VERSION="6.22.3"
 
 mkdir -p "$BUILD_DIR"
 
+make_requirements
+
 init_venv "$BUILD_DIR/venv-pyinstaller-$APP_TARGET_ARCH"
 assert_target_python_arch
 

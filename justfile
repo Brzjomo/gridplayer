@@ -2,7 +2,7 @@ default:
     just --list
 
 build-requirements:
-    if [ ! -f build/requirements.txt ]; then mkdir -p build && uv pip compile pyproject.toml -q --universal --no-annotate --no-header -o build/requirements.txt; fi
+    ./scripts/build_requirements.sh
 
 build:
     uv build

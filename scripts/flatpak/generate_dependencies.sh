@@ -26,6 +26,8 @@ process_requirements() {
 BUILD_DIR_PYTHON_DEPS="$BUILD_DIR/flatpak_python_deps"
 mkdir -p "$BUILD_DIR_PYTHON_DEPS"
 
+make_requirements
+
 cp "$BUILD_DIR/requirements.txt" "$BUILD_DIR_PYTHON_DEPS/requirements.txt"
 process_requirements "$BUILD_DIR_PYTHON_DEPS/requirements.txt"
 

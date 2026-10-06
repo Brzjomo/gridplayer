@@ -16,6 +16,8 @@ PYINSTALLER_VERSION="6.22.3"
 
 mkdir -p "$BUILD_DIR"
 
+make_requirements
+
 init_venv "$BUILD_DIR/venv-pyinstaller"
 
 # Reduce size by installing src version of pydantic
