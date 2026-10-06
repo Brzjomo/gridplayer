@@ -49,6 +49,9 @@ resources\translations\zh_CN.ts: 960 strings, 248 translated, 712 unfinished
   ...
 ```
 
+(That run is the one that topped `zh_CN` up from 305 strings; the code has
+**978** now, and `zh_CN.ts` holds all of them, translated.)
+
 Three things about it are deliberate:
 
 * **The code is flattened first**, in a copy. `pylupdate5` only sees a
@@ -57,22 +60,61 @@ Three things about it are deliberate:
   building the string in a statement of its own with `# fmt: skip`.
   `flatten_translate_calls.py` rewrites those in the copy so the extraction sees
   them — the same thing `build_ts.sh` does, and the reason a catalog built
-  without it is silently short.
+  without it is silently short. Measured when this script was written: the
+  unflattened extraction found **860** strings and the flattened one **960**.
 * **The catalog it writes carries no `<location>`.** The paths in an extracted
   file name the machine that ran the extraction and the temporary directory it
   used; the per-language files in this repo have never had them, and a diff full
   of somebody's `C:\Users\...` is not a reviewable one. Contexts are written in
   name order and indented two spaces, which is the shape the downloaded files
-  already have.
-* **What no longer matches is reported, not dropped quietly.** A string the code
-  stopped saying is a translation somebody wrote; the run names it so it can be
-  looked at rather than discovered later in a Crowdin diff.
+  already have. (`en_US.ts` is the exception, and is not written by this script:
+  see *The English template* below.)
+* **A string the code has grown since is appended to its context**, and one it
+  has stopped saying is reported rather than dropped quietly, so a top-up reads
+  as additions and removals rather than a rearrangement. The attributes the
+  catalog already carries — `language="de"`, not `de-DE` — are kept as they
+  were.
 
 `--apply` takes JSON files, each a list of
 `{"context": ..., "source": ..., "translation": ...}`. An entry is **refused**
 (and left unfinished) when its placeholders, its line breaks, its HTML tags or
 its leading/trailing spaces do not survive the trip, and the run says which and
-why. Nothing is written half-translated.
+why. Nothing is written half-translated. A translation that comes out identical
+to the English is applied but named — VLC's own mode names, key names and units
+are meant to be left alone.
+
+## What the catalogs currently hold
+
+`zh_CN.ts` is the catalog carried here: it holds **978** strings, the count the
+code has, all of them translated. It is what the interface is read in, and what
+`tests/test_translation_catalogs.py` measures the rest against.
+
+`en_US.ts` holds the same 978 and is regenerated rather than translated — see
+*The English template* below.
+
+The other languages are left where Crowdin last put them: **305** strings each,
+holding the translations that were approved there, and falling back to English
+for the six hundred the code has grown since. Topping them up is one command
+each and adds nothing a user sees — an unfinished entry means "show the
+English" — so it is done when somebody is going to translate that language by
+hand, not on the chance:
+
+```bash
+uv run scripts/translations/update_ts.py ja_JP
+```
+
+Worth knowing before doing it for a language: it is about 3,300 lines of
+catalog per language, and a Crowdin round would replace the file wholesale.
+
+## The English template
+
+`en_US.ts` is not a shipped catalog: it is the English source text, the file
+`scripts/translations/build_ts.sh` regenerates and the Crowdin recipes upload,
+and the application never loads it (`init_translator()` returns early for
+`en_US`). It is kept in the pipeline's own shape — pylupdate5's output, with
+relative `<location>` lines — and **`-ts` has to be given as a relative path**
+for those lines to come out relative; passed an absolute one, pylupdate5 writes
+the temporary directory it was run in into the file.
 
 ## Compiling
 
@@ -99,7 +141,7 @@ without touching icons, fonts or the other languages. Drop `-silent` and
 unfinished, which is the quickest way to see how far a language is:
 
 ```text
-Generated 960 translations (712 finished and 248 unfinished).
+Generated 978 translations (978 finished and 0 unfinished).
 ```
 
 ## Qt's own strings
@@ -142,14 +184,19 @@ a language translated in this tree is either exported to Crowdin before the next
 round or checked back in after one. Saying so where the round-trip happens is the
 whole of the protection, which is why `AGENTS.md` says it.
 
-Current state: **`zh_CN` is carried by hand**; the other languages are as they
-were last downloaded.
+Current state: **`zh_CN` is carried by hand** — translated here rather than
+downloaded — and `en_US.ts` is kept to match it, since a round uploads that file.
+A Crowdin round would take both back to whatever has been approved there, so
+`zh_CN` in particular is worth checking back in after one.
 
 ## Checking a language
 
-* `uv run pytest tests/test_translation_extraction.py tests/test_translation_timing.py`
-  — the strings are still written where `pylupdate5` can see them, and nothing
-  translates before the translator is installed.
+* `uv run pytest tests/test_translation_extraction.py tests/test_translation_timing.py
+  tests/test_translation_catalogs.py` — the strings are still written where
+  `pylupdate5` can see them, nothing translates before the translator is
+  installed, the English template knows every string `zh_CN.ts` knows, every
+  catalog in the tree is one the manifest carries, and every one of them has its
+  compiled `.qm` beside it.
 * `lrelease` without `-silent`, on the catalog, for the finished/unfinished count.
 * Load the `.qm` offscreen and ask it for a few strings — `QTranslator` on the
   file `init_translator()` loads, then `QCoreApplication.translate(context, source)`,

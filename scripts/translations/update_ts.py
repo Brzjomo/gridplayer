@@ -129,6 +129,19 @@ def read_messages(ts_file: Path):
     return contexts
 
 
+def read_header(ts_file: Path) -> dict:
+    """The <TS ...> attributes a catalog already carries.
+
+    Kept rather than made up: `language="de"` and `language="de-DE"` are both
+    what somebody once chose, and a top-up has no business renaming a catalog.
+    """
+
+    if not ts_file.is_file():
+        return {}
+
+    return dict(ElementTree.parse(ts_file).getroot().attrib)
+
+
 def read_applied(paths) -> dict:
     """Translations handed in, keyed by (context, source)."""
 
@@ -175,21 +188,40 @@ def left_in_english(source: str, translation: str) -> bool:
     return translation == source and bool(re.search(r"[A-Za-z]{3}", source))
 
 
-def render(language: str, messages, translations) -> str:
-    """The catalog as the repo keeps it: sorted, indented, no locations."""
+def render(language: str, messages, translations, header=None, order=None) -> str:
+    """The catalog as the repo keeps it: sorted contexts, no locations.
+
+    `order` is what the file already held, so that a string the code has grown
+    since is appended to the end of its context rather than dropped into the
+    middle of it: a top-up reads as additions, which is what it is.
+    """
+
+    attributes = {
+        "version": "2.1",
+        "language": language.replace("_", "-"),
+        "sourcelanguage": "en",
+        **(header or {}),
+    }
 
     lines = [
         '<?xml version="1.0" encoding="utf-8"?>',
         "<!DOCTYPE TS>",
-        f'<TS version="2.1" language="{language.replace("_", "-")}"'
-        ' sourcelanguage="en">',
+        "<TS "
+        + " ".join(f'{name}="{quoted(value)}"' for name, value in attributes.items())
+        + ">",
     ]
 
     for context in sorted(messages):
         lines.append("  <context>")
         lines.append(f"    <name>{escape(context)}</name>")
 
-        for source, was in messages[context]:
+        entries = messages[context]
+
+        if order and context in order:
+            rank = {source: index for index, source in enumerate(order[context])}
+            entries = sorted(entries, key=lambda entry: rank.get(entry[0], len(rank)))
+
+        for source, was in entries:
             translated = translations.get((context, source)) or was
 
             lines.append("    <message>")
@@ -279,8 +311,22 @@ def main():
 
     total, done = counts(extracted, translations)
 
+    # what the file held, so a top-up appends rather than rearranges
+    order = {
+        context: [source for source, _was in entries]
+        for context, entries in existing.items()
+    }
+
     ts_file.write_text(
-        render(args.language, extracted, translations), encoding="utf-8", newline="\n"
+        render(
+            args.language,
+            extracted,
+            translations,
+            header=read_header(ts_file),
+            order=order,
+        ),
+        encoding="utf-8",
+        newline="\n",
     )
 
     print(f"{ts_file}: {total} strings, {done} translated, {total - done} unfinished")
